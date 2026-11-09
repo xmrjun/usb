@@ -4,8 +4,8 @@
 fn main() {
     if let Err(problem) = usb_disk_ejector::gui::native::run() {
         use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
-        let text = wide(&format!("USB Disk Ejector could not start:\n\n{problem}"));
-        let caption = wide("USB Disk Ejector");
+        let text = wide(&format!("USB 安全弹出工具无法启动：\n\n{problem}"));
+        let caption = wide("USB 安全弹出工具");
         // SAFETY: both strings are NUL-terminated and live for the synchronous call.
         unsafe {
             MessageBoxW(
@@ -25,5 +25,5 @@ fn wide(value: &str) -> Vec<u16> {
 
 #[cfg(not(windows))]
 fn main() {
-    eprintln!("usb-ejector-gui is supported only on 64-bit Windows.");
+    eprintln!("USB 安全弹出工具仅支持 64 位 Windows。");
 }

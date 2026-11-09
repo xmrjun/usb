@@ -28,7 +28,7 @@ pub struct GuiState {
 impl GuiState {
     pub fn new() -> Self {
         Self {
-            status: "Ready".into(),
+            status: "就绪".into(),
             ..Self::default()
         }
     }
@@ -39,7 +39,7 @@ impl GuiState {
         }
         self.busy = true;
         self.generation = self.generation.wrapping_add(1);
-        self.status = "Refreshing device inventory…".into();
+        self.status = "正在刷新设备列表…".into();
         Some(self.generation)
     }
 
@@ -62,16 +62,16 @@ impl GuiState {
                     self.selected_id = None;
                 }
                 self.status = if devices.is_empty() {
-                    "No supported USB storage devices found.".into()
+                    "未发现支持的 USB 存储设备。请连接设备后刷新列表。".into()
                 } else {
-                    format!("Found {} physical USB device(s).", devices.len())
+                    format!("已发现 {} 个 USB 物理设备。", devices.len())
                 };
                 self.devices = devices;
             }
             Err(problem) => {
                 self.devices.clear();
                 self.selected_id = None;
-                self.status = format!("Refresh failed: {problem}");
+                self.status = format!("刷新失败：{problem}");
             }
         }
     }
@@ -86,34 +86,34 @@ impl GuiState {
                     .iter()
                     .map(|volume| {
                         let paths = if volume.mount_paths.is_empty() {
-                            "(no mount path)".into()
+                            "（无盘符或挂载路径）".into()
                         } else {
                             volume.mount_paths.join(", ")
                         };
                         let capacity = volume
                             .capacity_bytes
                             .map(format_capacity)
-                            .unwrap_or_else(|| "unknown size".into());
-                        format!("{paths} [{capacity} logical volume]")
+                            .unwrap_or_else(|| "容量未知".into());
+                        format!("{paths} [逻辑卷：{capacity}]")
                     })
                     .collect::<Vec<_>>();
                 GuiRow {
                     public_id: item.device.public_id.clone(),
                     name: item.device.name.clone(),
                     mounts: if mounts.is_empty() {
-                        "(no volumes)".into()
+                        "（无逻辑卷）".into()
                     } else {
                         mounts.join("; ")
                     },
-                    capacity: item
-                        .device
-                        .capacity_bytes()
-                        .map(format_capacity)
-                        .unwrap_or_else(|| "Multiple disks".into()),
+                    capacity: match item.device.capacity_bytes() {
+                        Some(0) => "未知".into(),
+                        Some(bytes) => format_capacity(bytes),
+                        None => "多个物理磁盘".into(),
+                    },
                     partitions: item.device.partition_count().to_string(),
                     status: match &item.eligibility {
-                        Ok(()) => "Ready".into(),
-                        Err(reason) => format!("Blocked: {reason}"),
+                        Ok(()) => "可以安全弹出".into(),
+                        Err(reason) => format!("已阻止弹出：{reason}"),
                     },
                     eligible: item.eligibility.is_ok(),
                 }
@@ -148,7 +148,7 @@ impl GuiState {
     pub fn confirmation_text(&self) -> Option<String> {
         let device = self.selected_device()?;
         Some(format!(
-            "Request Windows safe removal for this physical device?\n\n{}\nNo force-unmount or process termination will be attempted.",
+            "是否请求 Windows 安全弹出以下物理设备？\n\n{}\n请先保存相关文件并关闭正在使用该设备的程序。\n本工具不会强制卸载磁盘或终止程序。",
             device.impact_summary()
         ))
     }
@@ -156,7 +156,7 @@ impl GuiState {
     pub fn begin_eject(&mut self) -> Option<Device> {
         let device = self.selected_device()?.clone();
         self.busy = true;
-        self.status = "Revalidating device identity and requesting safe removal…".into();
+        self.status = "正在重新核对设备身份并请求安全弹出…".into();
         Some(device)
     }
 
@@ -168,10 +168,10 @@ impl GuiState {
         self.status = match result {
             Ok(EjectResult::Ejected) => {
                 self.selected_id = None;
-                "Windows accepted the safe-removal request.".into()
+                "Windows 已接受安全弹出请求。".into()
             }
             Ok(EjectResult::Rejected(failure)) => failure.user_message(),
-            Err(problem) => format!("Safe removal was not attempted: {problem}"),
+            Err(problem) => format!("未执行安全弹出：{problem}"),
         };
     }
 
@@ -183,7 +183,7 @@ impl GuiState {
 
     pub fn request_close(&mut self) -> bool {
         if self.busy {
-            self.status = "Wait for the current device operation to finish before closing.".into();
+            self.status = "请等待当前设备操作完成后再关闭窗口。".into();
             false
         } else {
             true

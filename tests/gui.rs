@@ -52,10 +52,33 @@ fn rows_show_name_mount_capacity_partitions_and_status() {
     let rows = state.rows();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].name, "USB Device A");
-    assert_eq!(rows[0].mounts, r"E:\ [15.5 GB logical volume]");
+    assert_eq!(rows[0].mounts, r"E:\ [逻辑卷：15.5 GB]");
     assert_eq!(rows[0].capacity, "16.0 GB");
     assert_eq!(rows[0].partitions, "1");
-    assert_eq!(rows[0].status, "Ready");
+    assert_eq!(rows[0].status, "可以安全弹出");
+}
+
+#[test]
+fn incomplete_device_stays_visible_with_unknown_capacity_and_cannot_be_ejected() {
+    let mut listed = device("A", r"E:\");
+    listed.device.disks[0].capacity_bytes = 0;
+    listed.eligibility = Err(usb_disk_ejector::policy::BlockReason::InventoryIncomplete);
+    let id = listed.device.public_id.clone();
+    let mut state = GuiState::new();
+    let generation = state.begin_refresh().unwrap();
+    state.finish_refresh(generation, Ok(vec![listed]));
+
+    let rows = state.rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].capacity, "未知");
+    assert!(rows[0].status.contains("检测信息不完整，暂不允许弹出"));
+    assert!(!rows[0].eligible);
+    assert!(state.select(&id));
+    assert_eq!(state.selected_id(), Some(id.as_str()));
+    assert!(!state.is_busy());
+    assert!(!state.can_eject());
+    assert!(state.confirmation_text().is_none());
+    assert!(state.begin_eject().is_none());
 }
 
 #[test]
@@ -92,7 +115,7 @@ fn close_is_deferred_while_a_device_operation_is_active() {
     let mut state = GuiState::new();
     let generation = state.begin_refresh().unwrap();
     assert!(!state.request_close());
-    assert!(state.status().contains("finish before closing"));
+    assert!(state.status().contains("操作完成后再关闭窗口"));
     state.finish_refresh(generation, Ok(vec![]));
     assert!(state.request_close());
 }
@@ -106,13 +129,13 @@ fn confirmation_and_veto_status_are_precise() {
     state.finish_refresh(generation, Ok(vec![listed]));
     state.select(&id);
     let confirmation = state.confirmation_text().unwrap();
-    assert!(confirmation.contains("Physical disk 5"));
+    assert!(confirmation.contains("物理磁盘 5"));
     assert!(confirmation.contains(r"E:\"));
 
     state.finish_eject(Ok(EjectResult::Rejected(EjectFailure {
         config_ret: 23,
         veto: Some((VetoKind::OutstandingOpen, "device-instance".into())),
     })));
-    assert!(state.status().contains("device instance identifier/path"));
-    assert!(!state.status().contains("occupying process"));
+    assert!(state.status().contains("设备实例标识符/路径"));
+    assert!(!state.status().contains("占用进程"));
 }

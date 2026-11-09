@@ -10,7 +10,11 @@ use std::sync::{
 
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
-    Graphics::Gdi::{GetStockObject, UpdateWindow, COLOR_WINDOW, DEFAULT_GUI_FONT},
+    Graphics::Gdi::{
+        CreateFontW, DeleteObject, GetStockObject, UpdateWindow, CLEARTYPE_QUALITY,
+        CLIP_DEFAULT_PRECIS, COLOR_WINDOW, DEFAULT_CHARSET, DEFAULT_GUI_FONT, DEFAULT_PITCH,
+        HFONT, OUT_DEFAULT_PRECIS,
+    },
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         Controls::{
@@ -61,6 +65,7 @@ struct App {
     refresh: Cell<HWND>,
     eject: Cell<HWND>,
     status: Cell<HWND>,
+    font: Cell<HFONT>,
     eject_cancellation: RefCell<Option<Cancellation>>,
     alive: Arc<AtomicBool>,
     queue: Arc<Mutex<VecDeque<WorkerMessage>>>,
@@ -74,6 +79,7 @@ impl App {
             refresh: Cell::new(null_mut()),
             eject: Cell::new(null_mut()),
             status: Cell::new(null_mut()),
+            font: Cell::new(null_mut()),
             eject_cancellation: RefCell::new(None),
             alive: Arc::new(AtomicBool::new(true)),
             queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -88,7 +94,7 @@ impl App {
             CreateWindowExW(
                 WS_EX_CLIENTEDGE,
                 WC_LISTVIEWW,
-                wide("Devices").as_ptr(),
+                wide("设备列表").as_ptr(),
                 list_style,
                 0,
                 0,
@@ -100,14 +106,14 @@ impl App {
                 null(),
             )
         };
-        let refresh = create_button(hwnd, ID_REFRESH, "Refresh")?;
-        let eject = create_button(hwnd, ID_EJECT, "Safely Eject")?;
+        let refresh = create_button(hwnd, ID_REFRESH, "刷新列表")?;
+        let eject = create_button(hwnd, ID_EJECT, "安全弹出")?;
         // SAFETY: class strings are NUL-terminated for the duration of the call.
         let status = unsafe {
             CreateWindowExW(
                 0,
                 wide("STATIC").as_ptr(),
-                wide("Ready").as_ptr(),
+                wide("就绪").as_ptr(),
                 WS_CHILD | WS_VISIBLE,
                 0,
                 0,
@@ -120,16 +126,38 @@ impl App {
             )
         };
         if list.is_null() || status.is_null() {
-            return Err(super::super::windows::last_error("CreateWindowExW control"));
+            return Err(super::super::windows::last_error("创建界面控件"));
         }
         self.list.set(list);
         self.refresh.set(refresh);
         self.eject.set(eject);
         self.status.set(status);
 
-        // SAFETY: all controls are live and the font is a process-lifetime stock object.
+        // SAFETY: the face name is NUL-terminated and CreateFontW copies it. App owns
+        // the created font until WM_NCDESTROY, after the child controls are destroyed.
         unsafe {
-            let font = GetStockObject(DEFAULT_GUI_FONT);
+            let created_font = CreateFontW(
+                -16,
+                0,
+                0,
+                0,
+                400,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET as u32,
+                OUT_DEFAULT_PRECIS as u32,
+                CLIP_DEFAULT_PRECIS as u32,
+                CLEARTYPE_QUALITY as u32,
+                DEFAULT_PITCH as u32,
+                wide("Microsoft YaHei UI").as_ptr(),
+            );
+            self.font.set(created_font);
+            let font = if created_font.is_null() {
+                GetStockObject(DEFAULT_GUI_FONT)
+            } else {
+                created_font
+            };
             for control in [list, refresh, eject, status] {
                 SendMessageW(control, WM_SETFONT, font as usize, 1);
             }
@@ -141,11 +169,11 @@ impl App {
             );
         }
         for (index, title, width) in [
-            (0, "Device", 230),
-            (1, "Drive / mount paths", 230),
-            (2, "Physical capacity", 120),
-            (3, "Partitions", 80),
-            (4, "Status", 320),
+            (0, "设备名称", 230),
+            (1, "盘符 / 挂载路径", 260),
+            (2, "物理容量", 120),
+            (3, "分区数", 80),
+            (4, "状态 / 原因", 340),
         ] {
             insert_column(list, index, title, width);
         }
@@ -167,7 +195,7 @@ impl App {
                 let mut backend = WindowsBackend::new();
                 backend.list_devices()
             }))
-            .unwrap_or_else(|_| Err(BackendError("inventory worker panicked".into())));
+            .unwrap_or_else(|_| Err(BackendError("读取设备列表时发生内部错误".into())));
             post_worker_result(
                 hwnd_value as HWND,
                 &alive,
@@ -189,7 +217,7 @@ impl App {
                 let mut backend = WindowsBackend::new();
                 backend.request_eject(&device, &cancellation)
             }))
-            .unwrap_or_else(|_| Err(BackendError("safe-removal worker panicked".into())));
+            .unwrap_or_else(|_| Err(BackendError("安全弹出时发生内部错误".into())));
             post_worker_result(
                 hwnd_value as HWND,
                 &alive,
@@ -204,7 +232,7 @@ impl App {
             Ok(mut queue) => queue.drain(..).collect::<Vec<_>>(),
             Err(_) => vec![WorkerMessage::Refresh(
                 0,
-                Err(BackendError("worker result queue was poisoned".into())),
+                Err(BackendError("无法读取设备操作的处理结果".into())),
             )],
         };
         for message in messages {
@@ -312,16 +340,29 @@ impl App {
             }
             let width = (rect.right - rect.left).max(400);
             let height = (rect.bottom - rect.top).max(240);
-            MoveWindow(list, 10, 10, width - 20, height - 100, 1);
-            MoveWindow(refresh, 10, height - 78, 110, 30, 1);
-            MoveWindow(eject, 130, height - 78, 130, 30, 1);
-            MoveWindow(status, 10, height - 38, width - 20, 24, 1);
+            MoveWindow(list, 10, 10, width - 20, height - 125, 1);
+            MoveWindow(refresh, 10, height - 103, 110, 32, 1);
+            MoveWindow(eject, 130, height - 103, 130, 32, 1);
+            MoveWindow(status, 10, height - 61, width - 20, 50, 1);
         }
     }
 
     fn cancel_pending_eject(&self) {
         if let Some(cancellation) = self.eject_cancellation.borrow().as_ref() {
             cancellation.cancel();
+        }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        let font = self.font.get();
+        if !font.is_null() {
+            // SAFETY: this font was created by App and the window's child controls
+            // have been destroyed before App is reclaimed during WM_NCDESTROY.
+            unsafe {
+                DeleteObject(font);
+            }
         }
     }
 }
@@ -334,7 +375,7 @@ pub fn run() -> Result<(), BackendError> {
             dwICC: ICC_LISTVIEW_CLASSES,
         };
         if InitCommonControlsEx(&controls) == 0 {
-            return Err(super::super::windows::last_error("InitCommonControlsEx"));
+            return Err(super::super::windows::last_error("初始化界面控件"));
         }
         let instance = GetModuleHandleW(null());
         let class_name = wide("UsbDiskEjectorRustWindow");
@@ -351,10 +392,10 @@ pub fn run() -> Result<(), BackendError> {
             lpszClassName: class_name.as_ptr(),
         };
         if RegisterClassW(&window_class) == 0 {
-            return Err(super::super::windows::last_error("RegisterClassW"));
+            return Err(super::super::windows::last_error("注册应用窗口"));
         }
         let mut pending_app = Some(Box::new(App::new()));
-        let title = wide("USB Disk Ejector — Safe Removal");
+        let title = wide("USB 安全弹出工具");
         let hwnd = CreateWindowExW(
             0,
             class_name.as_ptr(),
@@ -362,8 +403,8 @@ pub fn run() -> Result<(), BackendError> {
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            1050,
-            560,
+            1120,
+            600,
             null_mut(),
             null_mut(),
             instance,
@@ -371,7 +412,7 @@ pub fn run() -> Result<(), BackendError> {
         );
         if hwnd.is_null() {
             return Err(super::super::windows::last_error(
-                "CreateWindowExW main window",
+                "创建应用主窗口",
             ));
         }
         ShowWindow(hwnd, SW_SHOWDEFAULT);
@@ -380,7 +421,7 @@ pub fn run() -> Result<(), BackendError> {
         loop {
             let result = GetMessageW(&mut message, null_mut(), 0, 0);
             if result == -1 {
-                return Err(super::super::windows::last_error("GetMessageW"));
+                return Err(super::super::windows::last_error("读取窗口消息"));
             }
             if result == 0 {
                 break;
@@ -461,7 +502,7 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
                         let confirmation = app.state.borrow().confirmation_text();
                         if let Some(text) = confirmation {
                             let text = wide(&text);
-                            let caption = wide("Confirm safe removal");
+                            let caption = wide("确认安全弹出");
                             // SAFETY: window and NUL-terminated strings are valid.
                             let answer = unsafe {
                                 MessageBoxW(
@@ -611,7 +652,7 @@ fn create_button(parent: HWND, id: usize, text: &str) -> Result<HWND, BackendErr
         )
     };
     if button.is_null() {
-        Err(super::super::windows::last_error("CreateWindowExW button"))
+        Err(super::super::windows::last_error("创建操作按钮"))
     } else {
         Ok(button)
     }

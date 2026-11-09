@@ -1,6 +1,7 @@
 use usb_disk_ejector::raw::{
     checked_dependency_entries_end, needs_virtual_dependency_query, parse_dependency_utf16,
-    parse_disk_extents, parse_drive_layout, parse_multi_sz, parse_storage_descriptor, DiskExtent,
+    parse_disk_extents, parse_disk_geometry_capacity, parse_drive_layout, parse_multi_sz,
+    parse_storage_descriptor, DiskExtent,
 };
 
 fn push_u32(buffer: &mut [u8], offset: usize, value: u32) {
@@ -9,6 +10,38 @@ fn push_u32(buffer: &mut [u8], offset: usize, value: u32) {
 
 fn push_i64(buffer: &mut [u8], offset: usize, value: i64) {
     buffer[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+#[test]
+fn geometry_capacity_uses_exact_disk_size_from_the_minimum_valid_prefix() {
+    // DISK_GEOMETRY_EX may omit its variable-length Data tail. The geometry
+    // fields deliberately describe a different size, so capacity must come
+    // from DiskSize rather than multiplying legacy cylinder/sector values.
+    let mut bytes = vec![0_u8; 32];
+    push_i64(&mut bytes, 0, 1);
+    push_u32(&mut bytes, 12, 1);
+    push_u32(&mut bytes, 16, 1);
+    push_u32(&mut bytes, 20, 512);
+    push_i64(&mut bytes, 24, 128_035_676_160);
+    assert_eq!(parse_disk_geometry_capacity(&bytes), Ok(128_035_676_160));
+
+    bytes.extend_from_slice(&[0xff; 256]);
+    assert_eq!(parse_disk_geometry_capacity(&bytes), Ok(128_035_676_160));
+}
+
+#[test]
+fn geometry_capacity_rejects_every_truncated_prefix_and_nonpositive_size() {
+    let mut bytes = vec![0_u8; 32];
+    push_i64(&mut bytes, 24, 128_035_676_160);
+    for length in 0..32 {
+        assert!(parse_disk_geometry_capacity(&bytes[..length]).is_err());
+    }
+    for invalid_size in [0, -1, i64::MIN] {
+        push_i64(&mut bytes, 24, invalid_size);
+        assert!(parse_disk_geometry_capacity(&bytes).is_err());
+    }
+    push_i64(&mut bytes, 24, i64::MAX);
+    assert_eq!(parse_disk_geometry_capacity(&bytes), Ok(i64::MAX as u64));
 }
 
 #[test]

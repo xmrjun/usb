@@ -80,55 +80,55 @@ pub enum VetoKind {
 impl EjectFailure {
     pub fn user_message(&self) -> String {
         let prefix = format!(
-            "Windows rejected safe removal (CONFIGRET {}).",
+            "Windows 拒绝了安全弹出请求（CONFIGRET {}）。",
             self.config_ret
         );
         let Some((kind, name)) = &self.veto else {
             return format!(
-                "{prefix} Windows did not provide a veto reason or identify an occupying program or file."
+                "{prefix} Windows 未提供阻止原因，也未指出占用设备的程序或文件。"
             );
         };
         let clean_name = if name.trim().is_empty() {
-            "(no name supplied)"
+            "（未提供名称）"
         } else {
             name.trim()
         };
         let detail = match kind {
             VetoKind::OutstandingOpen => format!(
-                "Windows reports outstanding open handles. The veto name is a device instance identifier/path, not a process or file: {clean_name}"
+                "Windows 报告仍有打开的句柄。返回的是设备实例标识符/路径，并非进程或文件名称：{clean_name}"
             ),
             VetoKind::WindowsApp => {
-                format!("Windows reports an application veto named: {clean_name}")
+                format!("Windows 报告某个应用程序阻止了弹出，名称：{clean_name}")
             }
             VetoKind::WindowsService => {
-                format!("Windows reports a service veto named: {clean_name}")
+                format!("Windows 报告某个服务阻止了弹出，名称：{clean_name}")
             }
             VetoKind::Device => {
-                format!("Windows reports a related device veto: {clean_name}")
+                format!("Windows 报告相关设备阻止了弹出：{clean_name}")
             }
-            VetoKind::Driver => format!("Windows reports a driver veto: {clean_name}"),
+            VetoKind::Driver => format!("Windows 报告某个驱动程序阻止了弹出：{clean_name}"),
             VetoKind::PendingClose => {
-                "Windows reports that a close operation is still pending.".into()
+                "Windows 报告设备仍有待完成的关闭操作。".into()
             }
             VetoKind::InsufficientRights => {
-                "Windows reports insufficient rights for this device.".into()
+                "Windows 报告当前权限不足，无法弹出此设备。".into()
             }
             VetoKind::NonDisableable => {
-                "Windows reports that this device cannot be disabled safely.".into()
+                "Windows 报告无法安全禁用此设备。".into()
             }
             VetoKind::IllegalDeviceRequest => {
-                "Windows reports that safe removal is not valid for this device.".into()
+                "Windows 报告此设备不支持该安全弹出请求。".into()
             }
             VetoKind::InsufficientPower => {
-                "Windows reports an insufficient-power veto.".into()
+                "Windows 因供电不足而阻止了弹出。".into()
             }
             VetoKind::LegacyDevice => {
-                format!("Windows reports a legacy-device veto: {clean_name}")
+                format!("Windows 报告旧式设备阻止了弹出：{clean_name}")
             }
             VetoKind::LegacyDriver => {
-                format!("Windows reports a legacy-driver veto: {clean_name}")
+                format!("Windows 报告旧式驱动程序阻止了弹出：{clean_name}")
             }
-            VetoKind::Unknown => format!("Windows returned an unspecified veto: {clean_name}"),
+            VetoKind::Unknown => format!("Windows 未说明阻止弹出的具体原因：{clean_name}"),
         };
         format!("{prefix} {detail}")
     }

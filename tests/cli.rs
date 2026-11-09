@@ -114,7 +114,7 @@ fn eject_requires_exact_id_and_typed_confirmation() {
     assert_eq!(exit, 0);
     assert_eq!(backend.requested.len(), 1);
     let text = String::from_utf8(output).unwrap();
-    assert!(text.contains("Physical disk 3"));
+    assert!(text.contains("物理磁盘 3"));
     assert!(text.contains("safe removal was requested successfully"));
 }
 
@@ -186,7 +186,7 @@ fn outstanding_open_veto_does_not_claim_to_identify_a_process() {
     );
     let text = String::from_utf8(error).unwrap();
     assert_eq!(exit, 1);
-    assert!(text.contains("outstanding open handles"));
-    assert!(text.contains("device instance identifier"));
-    assert!(!text.contains("occupying process"));
+    assert!(text.contains("仍有打开的句柄"));
+    assert!(text.contains("设备实例标识符"));
+    assert!(!text.contains("占用进程"));
 }

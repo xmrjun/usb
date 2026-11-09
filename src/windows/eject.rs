@@ -20,7 +20,7 @@ pub(super) fn request_eject(
 ) -> Result<EjectResult, BackendError> {
     if cancellation.is_cancelled() {
         return Err(BackendError(
-            "safe removal was cancelled before revalidation".into(),
+            "在重新验证前已取消安全弹出".into(),
         ));
     }
     let fresh = snapshot()?;
@@ -31,18 +31,18 @@ pub(super) fn request_eject(
         .collect::<Vec<_>>();
     if matches.len() != 1 {
         return Err(BackendError(
-            "the selected device disappeared or became ambiguous after confirmation".into(),
+            "确认后设备已断开，或无法再唯一确定所选设备".into(),
         ));
     }
     let current = matches[0];
     if let Err(reason) = &current.eligibility {
         return Err(BackendError(format!(
-            "the selected device is no longer eligible after confirmation: {reason}"
+            "确认后设备已不满足安全弹出条件：{reason}"
         )));
     }
     if !expected.same_identity_and_impact(&current.device) {
         return Err(BackendError(
-            "device identity, disk numbers, volumes, extents, or mount paths changed after confirmation"
+            "确认后设备标识、磁盘编号、逻辑卷、磁盘范围或挂载路径发生了变化"
                 .into(),
         ));
     }
@@ -50,13 +50,13 @@ pub(super) fn request_eject(
 
     if cancellation.is_cancelled() {
         return Err(BackendError(
-            "safe removal was cancelled before the PnP request".into(),
+            "提交 PnP 请求前已取消安全弹出".into(),
         ));
     }
     confirm_target_identity(devinst, &current.device.target_instance_id)?;
     if cancellation.is_cancelled() {
         return Err(BackendError(
-            "safe removal was cancelled immediately before the PnP request".into(),
+            "在提交 PnP 请求前的最后检查中取消了安全弹出".into(),
         ));
     }
 

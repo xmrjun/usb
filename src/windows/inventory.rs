@@ -32,8 +32,8 @@ use windows_sys::Win32::{
     System::{
         Environment::ExpandEnvironmentStringsW,
         Ioctl::{
-            PropertyStandardQuery, StorageDeviceProperty, GET_LENGTH_INFORMATION,
-            GUID_DEVINTERFACE_DISK, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, IOCTL_DISK_GET_LENGTH_INFO,
+            PropertyStandardQuery, StorageDeviceProperty, GUID_DEVINTERFACE_DISK,
+            IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
             IOCTL_STORAGE_GET_DEVICE_NUMBER, IOCTL_STORAGE_QUERY_PROPERTY,
             STORAGE_DESCRIPTOR_HEADER, STORAGE_DEVICE_NUMBER, STORAGE_PROPERTY_QUERY,
         },
@@ -53,7 +53,8 @@ use crate::{
     policy::{evaluate_inventory, BusType, DiskCandidate, Inventory, ListedDevice, Target},
     raw::{
         checked_dependency_entries_end, needs_virtual_dependency_query, parse_dependency_utf16,
-        parse_disk_extents, parse_drive_layout, parse_multi_sz, parse_storage_descriptor,
+        parse_disk_extents, parse_disk_geometry_capacity, parse_drive_layout, parse_multi_sz,
+        parse_storage_descriptor,
     },
 };
 
@@ -69,18 +70,84 @@ pub(super) struct Snapshot {
 
 pub(super) fn snapshot() -> Result<Snapshot, BackendError> {
     let disks = enumerate_disks()?;
-    let volumes = enumerate_volumes()?;
-    let (critical_disk_numbers, critical_scan_complete) = critical_storage_usage(&volumes)?;
+    let volumes = match enumerate_volumes() {
+        Ok(volumes) => volumes,
+        Err(problem) => {
+            let mut diagnostics = ScanDiagnostics::default();
+            diagnostics.record("volume enumeration", problem);
+            VolumeEnumeration {
+                volumes: Vec::new(),
+                diagnostics,
+            }
+        }
+    };
+    let critical = critical_storage_usage(&volumes.volumes);
+    assemble_snapshot(disks, volumes, critical)
+}
+
+fn assemble_snapshot(
+    disks: DiskEnumeration,
+    volumes: VolumeEnumeration,
+    critical: Result<(BTreeSet<u32>, bool), BackendError>,
+) -> Result<Snapshot, BackendError> {
+    let mut critical_diagnostics = ScanDiagnostics::default();
+    let (critical_disk_numbers, critical_scan_complete) = critical_diagnostics
+        .capture("critical-storage scan", critical)
+        .unwrap_or_default();
+    let complete = disks.diagnostics.is_complete()
+        && volumes.diagnostics.is_complete()
+        && disks.virtual_dependency_scan_complete
+        && critical_scan_complete;
+    let first_error = disks
+        .diagnostics
+        .first_error
+        .or(volumes.diagnostics.first_error)
+        .or(critical_diagnostics.first_error);
     let listed = evaluate_inventory(Inventory {
         disks: disks.candidates,
-        volumes,
+        volumes: volumes.volumes,
         critical_disk_numbers,
         critical_scan_complete,
         virtual_dependency_scan_complete: disks.virtual_dependency_scan_complete,
         virtual_host_volume_ids: disks.virtual_host_volume_ids,
-        complete: true,
+        complete,
     });
+    // A partial inventory is useful for display, but policy blocks every row.
+    // If no USB row is known, report the actual query failure instead of an
+    // inaccurate "no devices" result.
+    if listed.is_empty() {
+        if let Some(problem) = first_error {
+            return Err(problem);
+        }
+    }
     Ok(Snapshot { listed })
+}
+
+#[derive(Default)]
+struct ScanDiagnostics {
+    first_error: Option<BackendError>,
+}
+
+impl ScanDiagnostics {
+    fn is_complete(&self) -> bool {
+        self.first_error.is_none()
+    }
+
+    fn record(&mut self, context: &str, problem: BackendError) {
+        if self.first_error.is_none() {
+            self.first_error = Some(BackendError(format!("{context}: {problem}")));
+        }
+    }
+
+    fn capture<T>(&mut self, context: &str, result: Result<T, BackendError>) -> Option<T> {
+        match result {
+            Ok(value) => Some(value),
+            Err(problem) => {
+                self.record(context, problem);
+                None
+            }
+        }
+    }
 }
 
 pub(super) fn locate_revalidated_target(
@@ -163,6 +230,7 @@ struct DiskEnumeration {
     candidates: Vec<DiskCandidate>,
     virtual_dependency_scan_complete: bool,
     virtual_host_volume_ids: BTreeSet<String>,
+    diagnostics: ScanDiagnostics,
 }
 
 fn enumerate_disks() -> Result<DiskEnumeration, BackendError> {
@@ -182,6 +250,7 @@ fn enumerate_disks() -> Result<DiskEnumeration, BackendError> {
     let mut candidates = Vec::new();
     let mut virtual_dependency_scan_complete = true;
     let mut virtual_host_volume_ids = BTreeSet::new();
+    let mut diagnostics = ScanDiagnostics::default();
 
     for index in 0_u32.. {
         let mut interface = zeroed_interface_data();
@@ -201,37 +270,75 @@ fn enumerate_disks() -> Result<DiskEnumeration, BackendError> {
             if error == ERROR_NO_MORE_ITEMS {
                 break;
             }
-            return Err(BackendError(format!(
-                "SetupDiEnumDeviceInterfaces failed with Win32 error {error}"
-            )));
+            diagnostics.record(
+                "disk enumeration",
+                BackendError(format!(
+                    "SetupDiEnumDeviceInterfaces failed with Win32 error {error}"
+                )),
+            );
+            break;
         }
 
-        let (path, devinfo) = interface_detail(&set, &interface)?;
-        let instance_id = device_id(devinfo.DevInst)?;
+        let Some((path, devinfo)) = diagnostics.capture(
+            &format!("disk interface {index}"),
+            interface_detail(&set, &interface),
+        ) else {
+            continue;
+        };
+        let Some(instance_id) = diagnostics.capture(&path, device_id(devinfo.DevInst)) else {
+            continue;
+        };
         let name = devnode_string(devinfo.DevInst, CM_DRP_FRIENDLYNAME)
             .or_else(|_| devnode_string(devinfo.DevInst, CM_DRP_DEVICEDESC))
             .unwrap_or_else(|_| "USB storage device".into());
-        let handle = OwnedHandle::open(&wide(&path))?;
-        let descriptor = storage_descriptor(&handle)?;
+        let Some(handle) = diagnostics.capture(&path, OwnedHandle::open(&wide(&path))) else {
+            continue;
+        };
+        let Some(descriptor) = diagnostics.capture(&path, storage_descriptor(&handle)) else {
+            continue;
+        };
         if needs_virtual_dependency_query(descriptor.bus_type) {
             match virtual_disk_host_volumes(&handle) {
                 Ok(host_volumes) if !host_volumes.is_empty() => {
                     virtual_host_volume_ids.extend(host_volumes);
                 }
-                Ok(_) | Err(_) => virtual_dependency_scan_complete = false,
+                Ok(_) => {
+                    virtual_dependency_scan_complete = false;
+                    diagnostics.record(
+                        &path,
+                        BackendError(
+                            "virtual-disk dependency query returned no host volumes".into(),
+                        ),
+                    );
+                }
+                Err(problem) => {
+                    virtual_dependency_scan_complete = false;
+                    diagnostics.record(&path, problem);
+                }
             }
         }
         if descriptor.bus_type != BusTypeUsb as u32 {
             continue;
         }
-        let device_number: STORAGE_DEVICE_NUMBER =
-            ioctl_fixed(&handle, IOCTL_STORAGE_GET_DEVICE_NUMBER)?;
-        let length: GET_LENGTH_INFORMATION = ioctl_fixed(&handle, IOCTL_DISK_GET_LENGTH_INFO)?;
-        if length.Length < 0 {
-            return Err(BackendError("disk length was negative".into()));
-        }
-        let layout = partition_layout(&handle)?;
-        let resolved_target = resolve_target(devinfo.DevInst, &instance_id)?;
+        let Some(device_number) = diagnostics.capture(
+            &path,
+            ioctl_fixed::<STORAGE_DEVICE_NUMBER>(&handle, IOCTL_STORAGE_GET_DEVICE_NUMBER),
+        ) else {
+            continue;
+        };
+        // Keep identified USB disks visible when later inspection fails. These
+        // display placeholders can never be approved: diagnostics makes the
+        // entire snapshot incomplete, including during eject revalidation.
+        let capacity_bytes = diagnostics.capture(&path, disk_capacity(&handle)).unwrap_or(0);
+        let layout = diagnostics
+            .capture(&path, partition_layout(&handle))
+            .unwrap_or(crate::raw::DriveLayout {
+                partitions: Vec::new(),
+                simple_data_only: false,
+            });
+        let resolved_target = diagnostics
+            .capture(&path, resolve_target(devinfo.DevInst, &instance_id))
+            .flatten();
 
         candidates.push(DiskCandidate {
             disk: Disk {
@@ -239,7 +346,7 @@ fn enumerate_disks() -> Result<DiskEnumeration, BackendError> {
                 number: device_number.DeviceNumber,
                 name,
                 serial: descriptor.serial,
-                capacity_bytes: length.Length as u64,
+                capacity_bytes,
                 partition_count: layout.partitions.len() as u32,
                 partitions: layout
                     .partitions
@@ -260,6 +367,7 @@ fn enumerate_disks() -> Result<DiskEnumeration, BackendError> {
         candidates,
         virtual_dependency_scan_complete,
         virtual_host_volume_ids,
+        diagnostics,
     })
 }
 
@@ -480,10 +588,24 @@ fn storage_descriptor(handle: &OwnedHandle) -> Result<crate::raw::StorageDescrip
 
 fn partition_layout(handle: &OwnedHandle) -> Result<crate::raw::DriveLayout, BackendError> {
     let bytes = ioctl_buffer(handle, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, 64 * 1024)?;
-    parse_drive_layout(&bytes).map_err(|error| BackendError(error.to_string()))
+    parse_drive_layout(&bytes)
+        .map_err(|error| BackendError(format!("IOCTL_DISK_GET_DRIVE_LAYOUT_EX: {error}")))
 }
 
-fn enumerate_volumes() -> Result<Vec<Volume>, BackendError> {
+fn disk_capacity(handle: &OwnedHandle) -> Result<u64, BackendError> {
+    // GET_LENGTH_INFO requires read access. GEOMETRY_EX permits the existing
+    // metadata-only handle and returns an exact size without elevation.
+    let bytes = ioctl_buffer(handle, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, 1024)?;
+    parse_disk_geometry_capacity(&bytes)
+        .map_err(|error| BackendError(format!("IOCTL_DISK_GET_DRIVE_GEOMETRY_EX: {error}")))
+}
+
+struct VolumeEnumeration {
+    volumes: Vec<Volume>,
+    diagnostics: ScanDiagnostics,
+}
+
+fn enumerate_volumes() -> Result<VolumeEnumeration, BackendError> {
     let mut name = vec![0_u16; 1024];
     // SAFETY: name is a writable buffer with the supplied element count.
     let raw_find = unsafe { FindFirstVolumeW(name.as_mut_ptr(), name.len() as u32) };
@@ -492,37 +614,15 @@ fn enumerate_volumes() -> Result<Vec<Volume>, BackendError> {
     }
     let find = VolumeFindHandle(raw_find);
     let mut volumes = Vec::new();
+    let mut diagnostics = ScanDiagnostics::default();
     loop {
-        let volume_name = decode_nul_terminated(&name)?;
-        let open_name = volume_name
-            .strip_suffix('\\')
-            .ok_or_else(|| BackendError("volume name lacks trailing slash".into()))?;
-        let handle = OwnedHandle::open(&wide(open_name))?;
-        let extent_bytes = ioctl_buffer(&handle, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, 64 * 1024)?;
-        let extents =
-            parse_disk_extents(&extent_bytes).map_err(|error| BackendError(error.to_string()))?;
-        let disk_numbers = extents
-            .iter()
-            .map(|extent| extent.disk_number)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        volumes.push(Volume {
-            id: volume_name.clone(),
-            mount_paths: volume_paths(&volume_name)?,
-            capacity_bytes: volume_capacity(&volume_name),
-            filesystem: volume_filesystem(&volume_name),
-            disk_numbers,
-            extents: extents
-                .into_iter()
-                .map(|extent| VolumeExtent {
-                    disk_number: extent.disk_number,
-                    starting_offset: extent.starting_offset,
-                    extent_length: extent.extent_length,
-                })
-                .collect(),
-            mapping_complete: true,
-        });
+        if let Some(volume_name) =
+            diagnostics.capture("volume name", decode_nul_terminated(&name))
+        {
+            if let Some(volume) = diagnostics.capture(&volume_name, inspect_volume(&volume_name)) {
+                volumes.push(volume);
+            }
+        }
 
         name.fill(0);
         // SAFETY: find is a live enumeration handle and name is writable.
@@ -533,12 +633,49 @@ fn enumerate_volumes() -> Result<Vec<Volume>, BackendError> {
             if error == ERROR_NO_MORE_FILES {
                 break;
             }
-            return Err(BackendError(format!(
-                "FindNextVolumeW failed with Win32 error {error}"
-            )));
+            diagnostics.record(
+                "volume enumeration",
+                BackendError(format!("FindNextVolumeW failed with Win32 error {error}")),
+            );
+            break;
         }
     }
-    Ok(volumes)
+    Ok(VolumeEnumeration {
+        volumes,
+        diagnostics,
+    })
+}
+
+fn inspect_volume(volume_name: &str) -> Result<Volume, BackendError> {
+    let open_name = volume_name
+        .strip_suffix('\\')
+        .ok_or_else(|| BackendError("volume name lacks trailing slash".into()))?;
+    let handle = OwnedHandle::open(&wide(open_name))?;
+    let extent_bytes = ioctl_buffer(&handle, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, 64 * 1024)?;
+    let extents = parse_disk_extents(&extent_bytes)
+        .map_err(|error| BackendError(format!("IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS: {error}")))?;
+    let disk_numbers = extents
+        .iter()
+        .map(|extent| extent.disk_number)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Ok(Volume {
+        id: volume_name.to_owned(),
+        mount_paths: volume_paths(volume_name)?,
+        capacity_bytes: volume_capacity(volume_name),
+        filesystem: volume_filesystem(volume_name),
+        disk_numbers,
+        extents: extents
+            .into_iter()
+            .map(|extent| VolumeExtent {
+                disk_number: extent.disk_number,
+                starting_offset: extent.starting_offset,
+                extent_length: extent.extent_length,
+            })
+            .collect(),
+        mapping_complete: true,
+    })
 }
 
 fn volume_capacity(volume_name: &str) -> Option<u64> {
@@ -1274,8 +1411,17 @@ fn ioctl_fixed<T>(handle: &OwnedHandle, code: u32) -> Result<T, BackendError> {
             null_mut(),
         )
     };
-    if ok == 0 || returned < size_of::<T>() as u32 {
-        return Err(super::last_error("DeviceIoControl fixed output"));
+    if ok == 0 {
+        // SAFETY: read immediately after the failed synchronous API call.
+        let error = unsafe { GetLastError() };
+        return Err(BackendError(format!(
+            "DeviceIoControl 0x{code:08x} failed with Win32 error {error}"
+        )));
+    }
+    if returned < size_of::<T>() as u32 {
+        return Err(BackendError(format!(
+            "DeviceIoControl 0x{code:08x} returned a truncated fixed output ({returned} bytes)"
+        )));
     }
     // SAFETY: DeviceIoControl initialized at least size_of::<T>() bytes.
     Ok(unsafe { output.assume_init() })
@@ -1304,16 +1450,18 @@ fn ioctl_buffer(handle: &OwnedHandle, code: u32, capacity: usize) -> Result<Vec<
         // SAFETY: GetLastError has no preconditions.
         let error = unsafe { GetLastError() };
         if error == ERROR_MORE_DATA || error == ERROR_INSUFFICIENT_BUFFER {
-            return Err(BackendError(
-                "IOCTL output exceeded the safety limit".into(),
-            ));
+            return Err(BackendError(format!(
+                "DeviceIoControl 0x{code:08x} output exceeded the {capacity}-byte safety limit"
+            )));
         }
         return Err(BackendError(format!(
-            "DeviceIoControl failed with Win32 error {error}"
+            "DeviceIoControl 0x{code:08x} failed with Win32 error {error}"
         )));
     }
     if returned as usize > bytes.len() {
-        return Err(BackendError("IOCTL returned an invalid byte count".into()));
+        return Err(BackendError(format!(
+            "DeviceIoControl 0x{code:08x} returned an invalid byte count ({returned})"
+        )));
     }
     bytes.truncate(returned as usize);
     Ok(bytes)
@@ -1344,4 +1492,88 @@ fn decode_nul_terminated(values: &[u16]) -> Result<String, BackendError> {
 
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{assemble_snapshot, DiskEnumeration, ScanDiagnostics, VolumeEnumeration};
+    use crate::{
+        backend::BackendError,
+        model::Disk,
+        policy::{BlockReason, BusType, DiskCandidate},
+    };
+    use std::collections::BTreeSet;
+
+    fn disks() -> DiskEnumeration {
+        let candidates = [4, 7]
+            .into_iter()
+            .map(|number| DiskCandidate {
+                disk: Disk {
+                    instance_id: format!("USBSTOR\\test-{number}"),
+                    number,
+                    name: format!("Test USB {number}"),
+                    serial: String::new(),
+                    capacity_bytes: 128_035_676_160,
+                    partition_count: 0,
+                    partitions: Vec::new(),
+                    partition_table_supported: false,
+                },
+                bus_type: BusType::Usb,
+                target: None,
+            })
+            .collect();
+        DiskEnumeration {
+            candidates,
+            virtual_dependency_scan_complete: true,
+            virtual_host_volume_ids: BTreeSet::new(),
+            diagnostics: ScanDiagnostics::default(),
+        }
+    }
+
+    fn volumes() -> VolumeEnumeration {
+        VolumeEnumeration {
+            volumes: Vec::new(),
+            diagnostics: ScanDiagnostics::default(),
+        }
+    }
+
+    #[test]
+    fn incomplete_disk_volume_or_critical_scan_preserves_rows_but_blocks_all() {
+        for failed_scan in 0..5 {
+            let mut disks = disks();
+            let mut volumes = volumes();
+            let mut critical = Ok((BTreeSet::new(), true));
+            let failure = || BackendError("simulated access denied".into());
+            match failed_scan {
+                0 => disks.diagnostics.record("unrelated disk", failure()),
+                1 => volumes.diagnostics.record("unrelated volume", failure()),
+                2 => critical = Err(failure()),
+                3 => critical = Ok((BTreeSet::new(), false)),
+                _ => disks.virtual_dependency_scan_complete = false,
+            }
+            let snapshot = assemble_snapshot(disks, volumes, critical).unwrap();
+            assert_eq!(snapshot.listed.len(), 2);
+            for item in snapshot.listed {
+                assert_eq!(item.eligibility, Err(BlockReason::InventoryIncomplete));
+            }
+        }
+    }
+
+    #[test]
+    fn failed_scan_with_no_usb_rows_reports_the_original_operation() {
+        let mut disks = disks();
+        disks.candidates.clear();
+        disks.diagnostics.record(
+            "disk interface 2",
+            BackendError("DeviceIoControl 0x000700a0 failed with Win32 error 5".into()),
+        );
+        let result = assemble_snapshot(disks, volumes(), Ok((BTreeSet::new(), true)));
+        let problem = match result {
+            Ok(_) => panic!("failed inventory must not be reported as an empty success"),
+            Err(problem) => problem,
+        };
+        assert!(problem.0.contains("disk interface 2"));
+        assert!(problem.0.contains("0x000700a0"));
+        assert!(problem.0.contains("Win32 error 5"));
+    }
 }

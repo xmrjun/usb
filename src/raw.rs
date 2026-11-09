@@ -45,6 +45,22 @@ pub fn needs_virtual_dependency_query(bus_type: u32) -> bool {
     matches!(bus_type, 14 | 15) // BusTypeVirtual | BusTypeFileBackedVirtual
 }
 
+/// Reads the exact physical size from the fixed prefix of DISK_GEOMETRY_EX.
+/// The 24-byte DISK_GEOMETRY is followed by a signed 64-bit DiskSize; the
+/// variable-length partition/detection data after that prefix is optional.
+pub fn parse_disk_geometry_capacity(bytes: &[u8]) -> Result<u64, ParseError> {
+    const DISK_SIZE_OFFSET: usize = 24;
+    const FIXED_PREFIX_SIZE: usize = DISK_SIZE_OFFSET + 8;
+    if bytes.len() < FIXED_PREFIX_SIZE {
+        return Err(ParseError("disk geometry buffer is truncated"));
+    }
+    let capacity = read_i64(bytes, DISK_SIZE_OFFSET)?;
+    if capacity <= 0 {
+        return Err(ParseError("disk geometry capacity is not positive"));
+    }
+    Ok(capacity as u64)
+}
+
 pub fn checked_dependency_entries_end(
     buffer_size: usize,
     entries_offset: usize,

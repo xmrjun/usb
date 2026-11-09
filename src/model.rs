@@ -82,13 +82,13 @@ impl Device {
     }
 
     pub fn impact_summary(&self) -> String {
-        let mut summary = format!("Device: {}\n", self.name);
+        let mut summary = format!("设备：{}\n", self.name);
         let mut disks = self.disks.iter().collect::<Vec<_>>();
         disks.sort_by_key(|disk| disk.number);
         for disk in disks {
             let _ = writeln!(
                 summary,
-                "Physical disk {}: {} ({})",
+                "物理磁盘 {}：{}（{}）",
                 disk.number,
                 disk.name,
                 format_capacity(disk.capacity_bytes)
@@ -102,17 +102,17 @@ impl Device {
             mounts.sort();
             let logical_size = volume
                 .capacity_bytes
-                .map(|bytes| format!("{} logical volume", format_capacity(bytes)))
-                .unwrap_or_else(|| "unknown logical volume size".into());
+                .map(|bytes| format!("逻辑卷容量：{}", format_capacity(bytes)))
+                .unwrap_or_else(|| "逻辑卷容量未知".into());
             if mounts.is_empty() {
                 let _ = writeln!(
                     summary,
-                    "Volume {} ({logical_size}; no mount path)",
+                    "逻辑卷 {}（{logical_size}；无盘符或挂载路径）",
                     volume.id
                 );
             } else {
                 for mount in mounts {
-                    let _ = writeln!(summary, "Mount: {mount} ({logical_size})");
+                    let _ = writeln!(summary, "盘符 / 挂载路径：{mount}（{logical_size}）");
                 }
             }
         }

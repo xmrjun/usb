@@ -3,7 +3,7 @@ mod handles;
 mod inventory;
 
 #[cfg(not(target_arch = "x86_64"))]
-compile_error!("the first Rust release supports only 64-bit Windows targets");
+compile_error!("本版本仅支持 64 位 Windows 目标平台");
 
 use windows_sys::Win32::Foundation::GetLastError;
 
@@ -44,5 +44,5 @@ impl Backend for WindowsBackend {
 pub(super) fn last_error(operation: &str) -> BackendError {
     // SAFETY: GetLastError has no preconditions and is read immediately after failure.
     let error = unsafe { GetLastError() };
-    BackendError(format!("{operation} failed with Win32 error {error}"))
+    BackendError(format!("{operation} 失败（Win32 错误 {error}）"))
 }

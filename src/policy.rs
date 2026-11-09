@@ -63,33 +63,33 @@ pub enum BlockReason {
 impl fmt::Display for BlockReason {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
-            Self::InventoryIncomplete => "device inventory is incomplete",
-            Self::TargetMissing => "no validated physical eject target was found",
-            Self::NotRemovable => "Windows does not mark the target removable",
-            Self::TopologyIncomplete => "the PnP topology could not be fully validated",
-            Self::HubTarget => "USB hubs are never eject targets",
-            Self::CompositeDevice => "the target has non-storage functions or siblings",
-            Self::VolumeMappingIncomplete => "one or more volume extents could not be mapped",
+            Self::InventoryIncomplete => "检测信息不完整，暂不允许弹出",
+            Self::TargetMissing => "未找到通过验证的物理弹出目标",
+            Self::NotRemovable => "Windows 未将此设备标记为可移除",
+            Self::TopologyIncomplete => "无法完整验证设备的 PnP 连接关系",
+            Self::HubTarget => "本工具不支持弹出 USB 集线器",
+            Self::CompositeDevice => "该设备还关联了非存储功能或其他设备",
+            Self::VolumeMappingIncomplete => "无法确认一个或多个逻辑卷对应的物理磁盘范围",
             Self::PartitionMappingIncomplete => {
-                "the partition table is unsupported or not fully represented by simple volumes"
+                "分区表不受支持，或分区与简单卷的对应关系不完整"
             }
             Self::UnsupportedFilesystem => {
-                "a volume is offline, RAW, or has an unsupported filesystem"
+                "某个逻辑卷已脱机、为 RAW 格式，或使用了不支持的文件系统"
             }
-            Self::CrossDiskVolume => "a volume spans this and another physical disk",
+            Self::CrossDiskVolume => "某个逻辑卷跨越了此设备和其他物理磁盘",
             Self::SystemDisk => {
-                "the device overlaps Windows, pagefile, crash-dump, boot, or service storage"
+                "此设备包含 Windows、分页文件、崩溃转储、启动或系统服务所需的存储内容"
             }
             Self::CriticalUseUnknown => {
-                "Windows critical-storage use could not be fully determined"
+                "无法完整确认 Windows 关键存储的使用情况"
             }
             Self::VirtualDiskDependencyUnknown => {
-                "attached virtual-disk backing storage could not be fully determined"
+                "无法完整确认已挂载虚拟磁盘所依赖的存储位置"
             }
             Self::MountedVirtualDiskDependency => {
-                "an attached virtual disk is backed by a file on this device"
+                "已挂载的虚拟磁盘使用了此设备上的文件"
             }
-            Self::IdentityCollision => "the public device identifier is ambiguous",
+            Self::IdentityCollision => "设备标识符存在冲突，无法唯一确定设备",
         };
         formatter.write_str(message)
     }

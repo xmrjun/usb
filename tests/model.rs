@@ -80,11 +80,11 @@ fn formats_capacity_without_overstating_precision() {
 fn exposes_physical_capacity_and_multi_volume_impact() {
     let device = sample_device();
     assert_eq!(device.capacity_bytes(), Some(64 * 1024 * 1024 * 1024));
-    assert!(device.impact_summary().contains("Physical disk 7"));
+    assert!(device.impact_summary().contains("物理磁盘 7"));
     assert!(device.impact_summary().contains(r"C:\mnt\camera\"));
     assert!(device.impact_summary().contains(r"E:\"));
-    assert!(device.impact_summary().contains("20.0 GB logical volume"));
-    assert!(device.impact_summary().contains("40.0 GB logical volume"));
+    assert!(device.impact_summary().contains("逻辑卷容量：20.0 GB"));
+    assert!(device.impact_summary().contains("逻辑卷容量：40.0 GB"));
 }
 
 #[test]

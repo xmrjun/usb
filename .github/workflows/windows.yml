@@ -2,7 +2,7 @@ name: Windows verification and experimental release
 
 on:
   push:
-    branches: [main]
+    branches: [main, "codex/**"]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
@@ -25,6 +25,10 @@ jobs:
           rustup toolchain install 1.80.0 --profile minimal --component clippy --component rustfmt
           rustup default 1.80.0
           rustup target add x86_64-pc-windows-msvc
+
+      - name: Normalize formatting for development builds
+        if: startsWith(github.ref, 'refs/heads/codex/')
+        run: cargo fmt --all
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -71,6 +75,29 @@ jobs:
               throw "Unexpected separately distributed runtime import in $path"
             }
           }
+
+      - name: Package portable test executables
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path portable -Force | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\usb-ejector-gui.exe portable\USB-Disk-Ejector-zh-CN.exe
+          Copy-Item target\x86_64-pc-windows-msvc\release\usb-ejector.exe portable\usb-ejector-cli.exe
+          Copy-Item EXPERIMENTAL-BUILD.txt portable\EXPERIMENTAL-BUILD.txt
+          git diff --binary --output=portable/formatting.patch
+          Compress-Archive -Path src,tests,Cargo.toml,Cargo.lock,build.rs,app.manifest,.cargo,.github,LICENSE,EXPERIMENTAL-BUILD.txt,THIRD_PARTY.md -DestinationPath portable\source.zip
+          $env:GITHUB_SHA | Set-Content portable\SOURCE-COMMIT.txt -Encoding utf8
+          Get-ChildItem portable\*.exe | ForEach-Object {
+            $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content portable\SHA256SUMS.txt -Encoding utf8
+
+      - name: Upload portable test build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: usb-windows-x64-zh-cn
+          path: portable/
+          if-no-files-found: error
+          retention-days: 14
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
