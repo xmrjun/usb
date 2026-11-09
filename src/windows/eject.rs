@@ -81,7 +81,7 @@ fn request_eject_inner(
     trace(
         diagnostics,
         started,
-        "普通弹出的有限重试仍被打开句柄/待关闭操作拒绝；检查管理员权限。",
+        "普通弹出被打开句柄、待关闭操作或卷设备拒绝；检查管理员权限以执行受控卷准备。",
     );
     let elevated = super::elevation::is_elevated();
     trace(
@@ -91,7 +91,7 @@ fn request_eject_inner(
     );
     if !elevated? {
         return Err(BackendError(
-            "普通弹出仍被占用，请用管理员模式重试。原始 Windows 拒绝详情已保留。".into(),
+            "Windows 拒绝了普通弹出，请用管理员模式执行受控卷准备。原始 Windows 拒绝详情已保留。".into(),
         ));
     }
     // Revalidate the complete confirmed impact immediately before opening any
@@ -287,15 +287,22 @@ fn request_once(
 }
 
 fn needs_volume_preparation(result: &EjectResult) -> bool {
-    matches!(
-        result,
-        EjectResult::Rejected(failure)
-            if failure.config_ret == CR_REMOVE_VETOED
-                && matches!(
-                    failure.veto.as_ref(),
-                    Some((VetoKind::OutstandingOpen | VetoKind::PendingClose, _))
-                )
-    )
+    let EjectResult::Rejected(failure) = result else {
+        return false;
+    };
+    if failure.config_ret != CR_REMOVE_VETOED {
+        return false;
+    }
+    // The veto name only selects a preparation attempt. It never supplies an
+    // operation target: all handles still come from the confirmed volumes and
+    // must pass fresh snapshot, same-handle extent and exclusive-lock checks.
+    match failure.veto.as_ref() {
+        Some((VetoKind::OutstandingOpen | VetoKind::PendingClose, _)) => true,
+        Some((VetoKind::Device, name)) => {
+            name.to_ascii_uppercase().starts_with("STORAGE\\VOLUME\\")
+        }
+        _ => false,
+    }
 }
 
 pub(super) fn trace(diagnostics: &mut String, started: Instant, message: &str) {
@@ -331,7 +338,7 @@ mod tests {
     use crate::backend::{EjectFailure, EjectResult, VetoKind};
 
     #[test]
-    fn preparation_is_limited_to_open_handle_and_pending_close_vetoes() {
+    fn preparation_accepts_open_handles_and_pending_closes() {
         for kind in [VetoKind::OutstandingOpen, VetoKind::PendingClose] {
             let rejected = |config_ret| {
                 EjectResult::Rejected(EjectFailure {
@@ -362,5 +369,35 @@ mod tests {
                 veto: None,
             }
         )));
+    }
+
+    #[test]
+    fn volume_device_refusal_can_prepare_but_other_devices_cannot() {
+        // Observed exFAT/NTFS volume-level refusals are not OutstandingOpen.
+        // Preparation still requires the independent device capability,
+        // administrator token, fresh identity/impact and every-volume lock.
+        for name in [
+            r"STORAGE\Volume\{8c1f7369-d685-11f1-9fb4-c88a9ad5a10f}#0000000000100000",
+            r"storage\volume\{test}\FileSystem\exfat",
+        ] {
+            let refused = |code| EjectResult::Rejected(EjectFailure {
+                config_ret: code,
+                veto: Some((VetoKind::Device, name.into())),
+            });
+            assert!(needs_volume_preparation(&refused(23)));
+            assert!(!needs_volume_preparation(&refused(5)));
+        }
+        for name in [
+            "",
+            r"USB\ROOT_HUB30\test",
+            r"USB\VID_174C&PID_235C\test",
+            r"SCSI\DISK\test",
+            r"STORAGE\VolumeShadowCopy\test",
+        ] {
+            assert!(!needs_volume_preparation(&EjectResult::Rejected(EjectFailure {
+                config_ret: 23,
+                veto: Some((VetoKind::Device, name.into())),
+            })));
+        }
     }
 }
