@@ -131,7 +131,7 @@ fn eject<B: Backend, R: BufRead, O: Write, E: Write>(
         return 2;
     }
 
-    match backend.request_eject(&selected.device, &Cancellation::new()) {
+    let exit_code = match backend.request_eject(&selected.device, &Cancellation::new()) {
         Ok(EjectResult::Ejected) => {
             let _ = writeln!(
                 output,
@@ -144,8 +144,14 @@ fn eject<B: Backend, R: BufRead, O: Write, E: Write>(
             1
         }
         Err(problem) => {
-            let _ = writeln!(error, "Safe removal was not attempted: {problem}");
+            let _ = writeln!(error, "Safe removal did not complete: {problem}");
             1
         }
+    };
+    if exit_code != 0 {
+        if let Some(details) = backend.diagnostics() {
+            let _ = writeln!(error, "Operation details:\n{details}");
+        }
     }
+    exit_code
 }

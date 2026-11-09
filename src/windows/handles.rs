@@ -1,6 +1,6 @@
 use windows_sys::Win32::{
     Devices::DeviceAndDriverInstallation::{SetupDiDestroyDeviceInfoList, HDEVINFO},
-    Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
+    Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE},
     Storage::FileSystem::{
         CreateFileW, FindVolumeClose, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
         OPEN_EXISTING,
@@ -24,11 +24,19 @@ pub(super) struct OwnedHandle(pub HANDLE);
 
 impl OwnedHandle {
     pub fn open(path: &[u16]) -> Result<Self, BackendError> {
+        Self::open_with_access(path, 0)
+    }
+
+    pub fn open_read_write(path: &[u16]) -> Result<Self, BackendError> {
+        Self::open_with_access(path, GENERIC_READ | GENERIC_WRITE)
+    }
+
+    fn open_with_access(path: &[u16], access: u32) -> Result<Self, BackendError> {
         // SAFETY: path is NUL-terminated, pointers are valid, and no security attributes are used.
         let handle = unsafe {
             CreateFileW(
                 path.as_ptr(),
-                0,
+                access,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 std::ptr::null(),
                 OPEN_EXISTING,
@@ -45,10 +53,25 @@ impl OwnedHandle {
     pub fn as_raw(&self) -> HANDLE {
         self.0
     }
+
+    pub fn close_checked(mut self) -> Result<(), BackendError> {
+        // Retire ownership before the call so Drop never repeats this explicit
+        // close against a handle value that Windows may subsequently reuse.
+        let handle = std::mem::replace(&mut self.0, INVALID_HANDLE_VALUE);
+        // SAFETY: this wrapper uniquely owns the live handle returned by CreateFileW.
+        let closed = unsafe { CloseHandle(handle) };
+        if closed == 0 {
+            return Err(super::last_error("CloseHandle"));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
+        if self.0 == INVALID_HANDLE_VALUE || self.0.is_null() {
+            return;
+        }
         // SAFETY: the handle is valid and uniquely owned by this wrapper.
         unsafe {
             CloseHandle(self.0);

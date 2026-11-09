@@ -22,6 +22,8 @@ enum Operation {
     Refreshing(u64),
     Confirming(Box<Device>),
     Ejecting,
+    Elevating,
+    ViewingDetails,
 }
 
 #[derive(Default)]
@@ -33,6 +35,7 @@ pub struct GuiState {
     removal_pending: bool,
     closed: bool,
     status: String,
+    operation_details: Option<String>,
 }
 
 impl GuiState {
@@ -203,6 +206,7 @@ impl GuiState {
             return None;
         }
         self.operation = Operation::Ejecting;
+        self.operation_details = None;
         self.status = "正在重新核对设备身份并请求安全弹出…".into();
         Some(*device)
     }
@@ -213,6 +217,7 @@ impl GuiState {
         }
         let device = self.selected_device()?.clone();
         self.operation = Operation::Ejecting;
+        self.operation_details = None;
         self.status = "正在重新核对设备身份并请求安全弹出…".into();
         Some(device)
     }
@@ -229,7 +234,7 @@ impl GuiState {
                 "Windows 已接受安全弹出请求。".into()
             }
             Ok(EjectResult::Rejected(failure)) => failure.user_message(),
-            Err(problem) => format!("未执行安全弹出：{problem}"),
+            Err(problem) => format!("未能完成安全弹出：{problem}"),
         };
     }
 
@@ -250,6 +255,58 @@ impl GuiState {
 
     pub fn status(&self) -> &str {
         &self.status
+    }
+
+    pub fn operation_details(&self) -> Option<&str> {
+        self.operation_details.as_deref()
+    }
+
+    pub fn set_operation_details(&mut self, details: Option<String>) {
+        if !self.closed {
+            self.operation_details = details;
+        }
+    }
+
+    pub fn begin_details(&mut self) -> Option<String> {
+        if !self.can_refresh() {
+            return None;
+        }
+        let details = self.operation_details.clone()?;
+        self.operation = Operation::ViewingDetails;
+        Some(details)
+    }
+
+    pub fn finish_details(&mut self) {
+        if !self.closed && matches!(self.operation, Operation::ViewingDetails) {
+            self.operation = Operation::Idle;
+        }
+    }
+
+    pub fn begin_elevation(&mut self) -> bool {
+        if !self.can_refresh() {
+            return false;
+        }
+        self.operation = Operation::Elevating;
+        self.status = "正在请求管理员权限，请在系统提示中确认。".into();
+        true
+    }
+
+    pub fn finish_elevation(&mut self, result: Result<(), BackendError>) -> bool {
+        if self.closed || !matches!(self.operation, Operation::Elevating) {
+            return false;
+        }
+        self.operation = Operation::Idle;
+        match result {
+            Ok(()) => {
+                // Suppress queued scans while WM_CLOSE is waiting to be dispatched.
+                self.close();
+                true
+            }
+            Err(problem) => {
+                self.status = problem.to_string();
+                false
+            }
+        }
     }
 
     pub fn is_busy(&self) -> bool {

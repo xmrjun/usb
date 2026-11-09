@@ -1,6 +1,8 @@
 mod eject;
+pub(crate) mod elevation;
 mod handles;
 mod inventory;
+mod volume_prepare;
 
 use std::sync::Mutex;
 
@@ -15,7 +17,9 @@ use crate::{
     policy::ListedDevice,
 };
 
-pub struct WindowsBackend;
+pub struct WindowsBackend {
+    diagnostic_details: String,
+}
 
 // GUI workers use separate backend instances. A scan must never open a disk or
 // volume while another worker is asking PnP to remove it, including retry gaps.
@@ -23,7 +27,9 @@ static DEVICE_OPERATION: Mutex<()> = Mutex::new(());
 
 impl WindowsBackend {
     pub fn new() -> Self {
-        Self
+        Self {
+            diagnostic_details: String::new(),
+        }
     }
 }
 
@@ -46,10 +52,15 @@ impl Backend for WindowsBackend {
         expected: &Device,
         cancellation: &Cancellation,
     ) -> Result<EjectResult, BackendError> {
+        self.diagnostic_details.clear();
         let _operation = DEVICE_OPERATION
             .lock()
             .map_err(|_| BackendError("设备操作异常中断，请重新启动程序。".into()))?;
-        eject::request_eject(expected, cancellation)
+        eject::request_eject(expected, cancellation, &mut self.diagnostic_details)
+    }
+
+    fn diagnostics(&self) -> Option<String> {
+        (!self.diagnostic_details.is_empty()).then(|| self.diagnostic_details.clone())
     }
 }
 

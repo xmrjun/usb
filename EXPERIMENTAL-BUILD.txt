@@ -1,7 +1,7 @@
 USB Disk Ejector — experimental Windows x64 build
 
-WARNING: This build is not a stable release and has not been exercised
-end-to-end on Windows with physical USB media. Use only with disposable test
+WARNING: This build is not a stable release. The new volume-preparation path
+has not yet passed end-to-end validation with physical USB media. Use disposable test
 media after saving all open work. The executables are not code-signed and may
 trigger Windows SmartScreen or publisher warnings.
 
@@ -10,8 +10,19 @@ partition/volume mapping, critical-storage use, or virtual-disk dependencies
 cannot be proven safe. Windows inventory and removal APIs are not one atomic
 transaction, so a residual time-of-check/time-of-use race remains.
 
-The program does not force-unmount volumes, terminate processes, elevate,
-install a service, write registry settings, or remain resident after exit.
+The normal path asks Windows to safely remove the confirmed USB device. If
+Windows continues to report outstanding opens or pending closes, administrator
+mode can try a volume-preparation path: lock every confirmed volume, flush and
+dismount only after every lock succeeds, close all handles, then request removal
+of the same USB device. Failure stops the operation and is recorded in Details.
+An incomplete preparation can leave some volumes dismounted; closing the handles
+allows Windows to mount them again. No successful removal is claimed unless
+Windows accepts the final request.
+
+The GUI's administrator button relaunches this same executable through UAC only
+when clicked; it does not carry out an eject automatically. The program does not
+force-unmount unlocked volumes, terminate other processes, install a service,
+write registry settings, or remain resident after exit.
 
 The GitHub prerelease notes identify the exact source commit, executable size,
 and SHA-256 digest. Verify that digest before testing.

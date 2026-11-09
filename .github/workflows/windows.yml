@@ -146,12 +146,17 @@ jobs:
           ### Important safety notice
 
           This is an **unsigned experimental prerelease**, not a stable release.
-          It has **not** been exercised end-to-end on Windows with physical USB
-          media. Windows SmartScreen or publisher warnings may appear. Save open
+          The new volume-preparation path has **not** passed end-to-end validation
+          with physical USB media. Windows SmartScreen or publisher warnings may appear. Save open
           work and test only with disposable media.
 
-          The tool is fail-closed and does not force-unmount, terminate programs,
-          elevate, install a service, modify the registry, or remain resident.
+          An explicit administrator button relaunches the same EXE through UAC.
+          Administrator mode may prepare volumes after persistent open-handle
+          vetoes: every confirmed volume must lock before any dismount, and all
+          handles must close before another request to the same USB target.
+          It does not force-unmount unlocked volumes, terminate programs, install
+          a service, modify the registry, or remain resident. Failure details
+          include any partial preparation; only Windows acceptance means success.
           Windows inventory and removal calls are not atomic, so residual
           time-of-check/time-of-use risk remains.
 

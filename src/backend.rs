@@ -18,6 +18,11 @@ pub trait Backend {
         expected: &Device,
         cancellation: &Cancellation,
     ) -> Result<EjectResult, BackendError>;
+
+    /// Diagnostic details from the last eject operation, when available.
+    fn diagnostics(&self) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Clone, Default)]

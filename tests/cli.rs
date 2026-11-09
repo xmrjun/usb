@@ -12,6 +12,7 @@ struct FakeBackend {
     devices: Vec<ListedDevice>,
     result: Result<EjectResult, BackendError>,
     requested: Vec<(String, String)>,
+    diagnostics: Option<String>,
 }
 
 impl Backend for FakeBackend {
@@ -28,6 +29,10 @@ impl Backend for FakeBackend {
         self.requested
             .push((expected.public_id.clone(), expected.fingerprint()));
         self.result.clone()
+    }
+
+    fn diagnostics(&self) -> Option<String> {
+        self.diagnostics.clone()
     }
 }
 
@@ -75,6 +80,7 @@ fn fake_backend(result: Result<EjectResult, BackendError>) -> FakeBackend {
         devices: vec![device()],
         result,
         requested: Vec::new(),
+        diagnostics: None,
     }
 }
 
@@ -189,4 +195,27 @@ fn outstanding_open_veto_does_not_claim_to_identify_a_process() {
     assert!(text.contains("仍有打开的句柄"));
     assert!(text.contains("设备实例标识符"));
     assert!(!text.contains("占用进程"));
+}
+
+#[test]
+fn failed_preparation_reports_its_stage_without_claiming_no_operation_was_attempted() {
+    let expected_id = device().device.public_id;
+    let mut backend = fake_backend(Err(BackendError("锁定卷失败".into())));
+    backend.diagnostics = Some("普通弹出 CONFIGRET=23\nFSCTL_LOCK_VOLUME Win32=5\nCloseHandle 成功".into());
+    let mut error = Vec::new();
+    let exit = run(
+        ["usb-ejector", "eject", expected_id.as_str()],
+        &mut backend,
+        Cursor::new(b"EJECT\n"),
+        Vec::new(),
+        &mut error,
+    );
+    let text = String::from_utf8(error).unwrap();
+    assert_eq!(exit, 1);
+    assert_eq!(backend.requested.len(), 1);
+    assert!(text.contains("Safe removal did not complete"));
+    assert!(text.contains("CONFIGRET=23"));
+    assert!(text.contains("FSCTL_LOCK_VOLUME Win32=5"));
+    assert!(text.contains("CloseHandle 成功"));
+    assert!(!text.contains("was not attempted"));
 }

@@ -34,7 +34,8 @@ use windows_sys::Win32::{
             BS_PUSHBUTTON, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
             DBT_DEVICEARRIVAL, DBT_DEVICEQUERYREMOVE, DBT_DEVICEQUERYREMOVEFAILED,
             DBT_DEVICEREMOVECOMPLETE, DBT_DEVICEREMOVEPENDING, DBT_DEVNODES_CHANGED, GWLP_USERDATA,
-            IDC_ARROW, IDYES, MB_ICONWARNING, MB_YESNO, MSG, SW_SHOWDEFAULT, WM_APP, WM_CLOSE,
+            IDC_ARROW, IDYES, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MSG,
+            SW_SHOWDEFAULT, WM_APP, WM_CLOSE,
             WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DEVICECHANGE, WM_NCCREATE, WM_NCDESTROY,
             WM_NOTIFY, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD, WS_EX_CLIENTEDGE,
             WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
@@ -47,18 +48,20 @@ use crate::{
     gui::GuiState,
     model::Device,
     policy::ListedDevice,
-    windows::WindowsBackend,
+    windows::{elevation, WindowsBackend},
 };
 
 const ID_REFRESH: usize = 1001;
 const ID_EJECT: usize = 1002;
+const ID_ELEVATE: usize = 1003;
+const ID_DETAILS: usize = 1004;
 const WM_WORKER_DONE: u32 = WM_APP + 1;
 const TIMER_DEVICE_CHANGE: usize = 1;
 const TIMER_AFTER_EJECT: usize = 2;
 
 enum WorkerMessage {
     Refresh(u64, Result<Vec<ListedDevice>, BackendError>),
-    Eject(Result<EjectResult, BackendError>),
+    Eject(Result<EjectResult, BackendError>, Option<String>),
 }
 
 struct App {
@@ -66,6 +69,9 @@ struct App {
     list: Cell<HWND>,
     refresh: Cell<HWND>,
     eject: Cell<HWND>,
+    elevate: Cell<HWND>,
+    details: Cell<HWND>,
+    elevated: bool,
     status: Cell<HWND>,
     font: Cell<HFONT>,
     eject_cancellation: RefCell<Option<Cancellation>>,
@@ -74,12 +80,15 @@ struct App {
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(elevated: bool) -> Self {
         Self {
             state: RefCell::new(GuiState::new()),
             list: Cell::new(null_mut()),
             refresh: Cell::new(null_mut()),
             eject: Cell::new(null_mut()),
+            elevate: Cell::new(null_mut()),
+            details: Cell::new(null_mut()),
+            elevated,
             status: Cell::new(null_mut()),
             font: Cell::new(null_mut()),
             eject_cancellation: RefCell::new(None),
@@ -110,6 +119,8 @@ impl App {
         };
         let refresh = create_button(hwnd, ID_REFRESH, "刷新列表")?;
         let eject = create_button(hwnd, ID_EJECT, "安全弹出")?;
+        let elevate = create_button(hwnd, ID_ELEVATE, "管理员模式")?;
+        let details = create_button(hwnd, ID_DETAILS, "详细信息")?;
         // SAFETY: class strings are NUL-terminated for the duration of the call.
         let status = unsafe {
             CreateWindowExW(
@@ -133,6 +144,8 @@ impl App {
         self.list.set(list);
         self.refresh.set(refresh);
         self.eject.set(eject);
+        self.elevate.set(elevate);
+        self.details.set(details);
         self.status.set(status);
 
         // SAFETY: the face name is NUL-terminated and CreateFontW copies it. App owns
@@ -160,7 +173,7 @@ impl App {
             } else {
                 created_font
             };
-            for control in [list, refresh, eject, status] {
+            for control in [list, refresh, eject, elevate, details, status] {
                 SendMessageW(control, WM_SETFONT, font as usize, 1);
             }
             SendMessageW(
@@ -215,16 +228,22 @@ impl App {
         let queue = Arc::clone(&self.queue);
         let hwnd_value = hwnd as usize;
         std::thread::spawn(move || {
-            let result = catch_unwind(AssertUnwindSafe(|| {
+            let (result, details) = catch_unwind(AssertUnwindSafe(|| {
                 let mut backend = WindowsBackend::new();
-                backend.request_eject(&device, &cancellation)
+                let result = backend.request_eject(&device, &cancellation);
+                (result, backend.diagnostics())
             }))
-            .unwrap_or_else(|_| Err(BackendError("安全弹出时发生内部错误".into())));
+            .unwrap_or_else(|_| {
+                (
+                    Err(BackendError("安全弹出时发生内部错误".into())),
+                    Some("安全弹出时发生内部错误，无法取得完整诊断。".into()),
+                )
+            });
             post_worker_result(
                 hwnd_value as HWND,
                 &alive,
                 &queue,
-                WorkerMessage::Eject(result),
+                WorkerMessage::Eject(result, details),
             );
         });
     }
@@ -243,9 +262,13 @@ impl App {
                     self.state.borrow_mut().finish_refresh(generation, result);
                     self.populate_rows();
                 }
-                WorkerMessage::Eject(result) => {
+                WorkerMessage::Eject(result, details) => {
                     let succeeded = matches!(result, Ok(EjectResult::Ejected));
-                    self.state.borrow_mut().finish_eject(result);
+                    {
+                        let mut state = self.state.borrow_mut();
+                        state.set_operation_details(details);
+                        state.finish_eject(result);
+                    }
                     self.eject_cancellation.borrow_mut().take();
                     if succeeded {
                         // SAFETY: hwnd is live while processing its message.
@@ -293,21 +316,34 @@ impl App {
     }
 
     fn update_controls(&self) {
-        let (can_refresh, can_eject, status_text) = {
+        let (can_refresh, can_eject, has_details, status_text) = {
             let state = self.state.borrow();
             (
                 state.can_refresh(),
                 state.can_eject(),
+                state.operation_details().is_some(),
                 state.status().to_owned(),
             )
         };
         let refresh = self.refresh.get();
         let eject = self.eject.get();
+        let elevate = self.elevate.get();
+        let details = self.details.get();
         let status = self.status.get();
+        let status_text = if has_details && status_text.chars().count() > 100 {
+            format!(
+                "{}…（完整过程见“详细信息”）",
+                status_text.chars().take(85).collect::<String>()
+            )
+        } else {
+            status_text
+        };
         // SAFETY: controls are live while App is attached to the window.
         unsafe {
             EnableWindow(refresh, can_refresh as i32);
             EnableWindow(eject, can_eject as i32);
+            EnableWindow(elevate, (can_refresh && !self.elevated) as i32);
+            EnableWindow(details, (can_refresh && has_details) as i32);
             let status_text = wide(&status_text);
             SetWindowTextW(status, status_text.as_ptr());
         }
@@ -333,6 +369,8 @@ impl App {
         let list = self.list.get();
         let refresh = self.refresh.get();
         let eject = self.eject.get();
+        let elevate = self.elevate.get();
+        let details = self.details.get();
         let status = self.status.get();
         // SAFETY: hwnd and child controls are live, rect is writable.
         unsafe {
@@ -342,9 +380,15 @@ impl App {
             }
             let width = (rect.right - rect.left).max(400);
             let height = (rect.bottom - rect.top).max(240);
-            MoveWindow(list, 10, 10, width - 20, height - 125, 1);
-            MoveWindow(refresh, 10, height - 103, 110, 32, 1);
-            MoveWindow(eject, 130, height - 103, 130, 32, 1);
+            let wrapped = width < 540;
+            let controls_top = height - if wrapped { 145 } else { 103 };
+            MoveWindow(list, 10, 10, width - 20, controls_top - 22, 1);
+            MoveWindow(refresh, 10, controls_top, 110, 32, 1);
+            MoveWindow(eject, 130, controls_top, 130, 32, 1);
+            let extra_top = controls_top + if wrapped { 42 } else { 0 };
+            let extra_left = if wrapped { 10 } else { 270 };
+            MoveWindow(elevate, extra_left, extra_top, 130, 32, 1);
+            MoveWindow(details, extra_left + 140, extra_top, 110, 32, 1);
             MoveWindow(status, 10, height - 61, width - 20, 50, 1);
         }
     }
@@ -353,6 +397,48 @@ impl App {
         if let Some(cancellation) = self.eject_cancellation.borrow().as_ref() {
             cancellation.cancel();
         }
+    }
+
+    fn start_elevation(&self, hwnd: HWND) {
+        if self.elevated || !self.state.borrow_mut().begin_elevation() {
+            return;
+        }
+        self.update_controls();
+        // ShellExecuteW may pump messages while UAC is shown. The state remains
+        // reserved and no RefCell borrow crosses that call.
+        let result = elevation::relaunch_elevated(hwnd);
+        let relaunched = self.state.borrow_mut().finish_elevation(result);
+        self.update_controls();
+        if relaunched {
+            // SAFETY: hwnd is live; the closed state prevents queued scans from
+            // starting before this deferred close is dispatched.
+            unsafe {
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
+        }
+    }
+
+    fn show_details(&self, hwnd: HWND) {
+        let details = self.state.borrow_mut().begin_details();
+        let Some(details) = details else {
+            return;
+        };
+        self.update_controls();
+        let text = format!(
+            "上次安全弹出操作的详细信息\n按 Ctrl+C 可复制此窗口内容。\n\n{details}"
+        );
+        // SAFETY: hwnd and NUL-terminated strings are valid for the modal call.
+        // No state borrow is retained while MessageBoxW pumps window messages.
+        unsafe {
+            MessageBoxW(
+                hwnd,
+                wide(&text).as_ptr(),
+                wide("详细信息").as_ptr(),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+        self.state.borrow_mut().finish_details();
+        self.update_controls();
     }
 }
 
@@ -370,6 +456,7 @@ impl Drop for App {
 }
 
 pub fn run() -> Result<(), BackendError> {
+    let elevated = elevation::is_elevated()?;
     // SAFETY: all Win32 structures are initialized and pointers remain valid through each call.
     unsafe {
         let controls = INITCOMMONCONTROLSEX {
@@ -396,8 +483,12 @@ pub fn run() -> Result<(), BackendError> {
         if RegisterClassW(&window_class) == 0 {
             return Err(super::super::windows::last_error("注册应用窗口"));
         }
-        let mut pending_app = Some(Box::new(App::new()));
-        let title = wide("USB 安全弹出工具");
+        let mut pending_app = Some(Box::new(App::new(elevated)));
+        let title = wide(if elevated {
+            "USB 安全弹出工具（管理员）"
+        } else {
+            "USB 安全弹出工具（普通权限）"
+        });
         let hwnd = CreateWindowExW(
             0,
             class_name.as_ptr(),
@@ -517,6 +608,8 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
             if notification as u32 == BN_CLICKED {
                 match id {
                     ID_REFRESH => app.start_refresh(hwnd),
+                    ID_ELEVATE => app.start_elevation(hwnd),
+                    ID_DETAILS => app.show_details(hwnd),
                     ID_EJECT => {
                         let confirmation = app.state.borrow_mut().begin_confirmation();
                         if let Some(text) = confirmation {
@@ -801,7 +894,7 @@ mod tests {
     fn native_window_preserves_title_and_suspends_scans_during_removal() {
         let class_name = wide("UsbEjectorNativeRegressionWindow");
         let title = wide("USB 安全弹出工具");
-        let mut pending = Some(Box::new(App::new()));
+        let mut pending = Some(Box::new(App::new(false)));
         // SAFETY: buffers and the pending Box outlive synchronous creation;
         // the hidden test window is destroyed before its class is unregistered.
         unsafe {

@@ -241,3 +241,74 @@ fn external_removal_suppresses_refresh_and_invalidates_an_open_confirmation() {
     assert!(state.can_refresh());
     assert!(state.begin_refresh().is_some());
 }
+
+#[test]
+fn operation_details_survive_refresh_and_cancelled_confirmation_until_a_new_eject() {
+    let mut state = GuiState::new();
+    let listed = device("A", r"E:\");
+    let id = listed.device.public_id.clone();
+    let generation = state.begin_refresh().unwrap();
+    state.finish_refresh(generation, Ok(vec![listed.clone()]));
+    assert!(state.select(&id));
+    assert!(state.begin_eject().is_some());
+    state.set_operation_details(Some("volume lock failed: Win32 32".into()));
+    state.finish_eject(Err(BackendError("test rejection".into())));
+    assert!(state.status().contains("未能完成安全弹出"));
+
+    let generation = state.begin_refresh().unwrap();
+    state.finish_refresh(generation, Ok(vec![listed]));
+    assert!(state.begin_confirmation().is_some());
+    assert!(state.finish_confirmation(false).is_none());
+    assert_eq!(
+        state.operation_details(),
+        Some("volume lock failed: Win32 32")
+    );
+
+    assert!(state.begin_confirmation().is_some());
+    assert!(state.finish_confirmation(true).is_some());
+    assert_eq!(state.operation_details(), None);
+    state.set_operation_details(Some("second operation".into()));
+    state.finish_eject(Err(BackendError("test rejection".into())));
+    assert!(state.begin_eject().is_some());
+    assert_eq!(state.operation_details(), None);
+}
+
+#[test]
+fn details_dialog_reserves_state_and_keeps_the_diagnostic_snapshot() {
+    let mut state = GuiState::new();
+    state.set_operation_details(Some("original diagnostics".into()));
+    assert_eq!(state.begin_details().as_deref(), Some("original diagnostics"));
+    assert!(state.begin_refresh().is_none());
+    assert!(!state.begin_elevation());
+    assert!(!state.request_close());
+    state.finish_details();
+    assert!(!state.is_busy());
+    assert_eq!(state.operation_details(), Some("original diagnostics"));
+
+    let generation = state.begin_refresh().unwrap();
+    state.finish_refresh(generation, Err(BackendError("refresh failed".into())));
+    assert_eq!(state.operation_details(), Some("original diagnostics"));
+    state.close();
+    state.set_operation_details(Some("late callback".into()));
+    assert_eq!(state.operation_details(), Some("original diagnostics"));
+    assert!(state.begin_details().is_none());
+}
+
+#[test]
+fn elevation_reserves_the_window_and_success_prevents_queued_work() {
+    let mut state = GuiState::new();
+    assert!(state.begin_elevation());
+    assert!(!state.begin_elevation());
+    assert!(state.begin_refresh().is_none());
+    assert!(state.begin_eject().is_none());
+    assert!(!state.request_close());
+    assert!(!state.finish_elevation(Err(BackendError("UAC cancelled".into()))));
+    assert!(!state.is_busy());
+    assert!(state.can_refresh());
+
+    assert!(state.begin_elevation());
+    assert!(state.finish_elevation(Ok(())));
+    assert!(state.request_close());
+    assert!(state.begin_refresh().is_none());
+    assert!(!state.begin_elevation());
+}
