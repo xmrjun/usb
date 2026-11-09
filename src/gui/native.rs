@@ -45,7 +45,7 @@ use windows_sys::Win32::{
 
 use crate::{
     backend::{Backend, BackendError, Cancellation, EjectResult},
-    gui::GuiState,
+    gui::{window_title, GuiState},
     model::Device,
     policy::ListedDevice,
     windows::{elevation, WindowsBackend},
@@ -197,7 +197,22 @@ impl App {
     }
 
     fn start_refresh(&self, hwnd: HWND) {
-        let generation = self.state.borrow_mut().begin_refresh();
+        self.start_refresh_with_mode(hwnd, false);
+    }
+
+    fn start_background_refresh(&self, hwnd: HWND) {
+        self.start_refresh_with_mode(hwnd, true);
+    }
+
+    fn start_refresh_with_mode(&self, hwnd: HWND, background: bool) {
+        let generation = {
+            let mut state = self.state.borrow_mut();
+            if background {
+                state.begin_background_refresh()
+            } else {
+                state.begin_refresh()
+            }
+        };
         let Some(generation) = generation else {
             return;
         };
@@ -263,18 +278,19 @@ impl App {
                     self.populate_rows();
                 }
                 WorkerMessage::Eject(result, details) => {
-                    let succeeded = matches!(result, Ok(EjectResult::Ejected));
                     {
                         let mut state = self.state.borrow_mut();
                         state.set_operation_details(details);
                         state.finish_eject(result);
                     }
                     self.eject_cancellation.borrow_mut().take();
-                    if succeeded {
-                        // SAFETY: hwnd is live while processing its message.
-                        unsafe {
-                            SetTimer(hwnd, TIMER_AFTER_EJECT, 700, None);
-                        }
+                    // Coalesce notifications from this operation only after it
+                    // finishes. A failed preparation may also change the list;
+                    // the background refresh preserves its failure and details.
+                    // SAFETY: hwnd is live while processing its message.
+                    unsafe {
+                        KillTimer(hwnd, TIMER_DEVICE_CHANGE);
+                        SetTimer(hwnd, TIMER_AFTER_EJECT, 700, None);
                     }
                 }
             }
@@ -484,11 +500,7 @@ pub fn run() -> Result<(), BackendError> {
             return Err(super::super::windows::last_error("注册应用窗口"));
         }
         let mut pending_app = Some(Box::new(App::new(elevated)));
-        let title = wide(if elevated {
-            "USB 安全弹出工具（管理员）"
-        } else {
-            "USB 安全弹出工具（普通权限）"
-        });
+        let title = wide(&window_title(elevated));
         let hwnd = CreateWindowExW(
             0,
             class_name.as_ptr(),
@@ -670,7 +682,25 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
                     }
                     app.update_controls();
                 }
-                DBT_DEVICEQUERYREMOVEFAILED | DBT_DEVICEREMOVECOMPLETE => {
+                DBT_DEVICEQUERYREMOVEFAILED => {
+                    let refresh_now = {
+                        let mut state = app.state.borrow_mut();
+                        state.removal_finished();
+                        !state.is_ejecting()
+                    };
+                    // The running eject owns its completion refresh. Do not
+                    // queue a competing timer after each rejected PnP attempt.
+                    // SAFETY: both timer operations target this live window.
+                    unsafe {
+                        if refresh_now {
+                            SetTimer(hwnd, TIMER_DEVICE_CHANGE, 400, None);
+                        } else {
+                            KillTimer(hwnd, TIMER_DEVICE_CHANGE);
+                        }
+                    }
+                    app.update_controls();
+                }
+                DBT_DEVICEREMOVECOMPLETE => {
                     app.state.borrow_mut().removal_finished();
                     // SAFETY: removal ended; a deferred scan may update rows.
                     unsafe {
@@ -708,7 +738,7 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
                         SetTimer(hwnd, timer, 400, None);
                     }
                 } else {
-                    app.start_refresh(hwnd);
+                    app.start_background_refresh(hwnd);
                 }
             }
             0
@@ -893,7 +923,8 @@ mod tests {
     #[test]
     fn native_window_preserves_title_and_suspends_scans_during_removal() {
         let class_name = wide("UsbEjectorNativeRegressionWindow");
-        let title = wide("USB 安全弹出工具");
+        let expected_title = window_title(false);
+        let title = wide(&expected_title);
         let mut pending = Some(Box::new(App::new(false)));
         // SAFETY: buffers and the pending Box outlive synchronous creation;
         // the hidden test window is destroyed before its class is unregistered.
@@ -937,13 +968,55 @@ mod tests {
             let after_pending = test_state(hwnd);
             SendMessageW(hwnd, WM_DEVICECHANGE, DBT_DEVICEREMOVECOMPLETE as usize, 0);
             let after_complete = test_state(hwnd);
+            let removal_refresh_scheduled = KillTimer(hwnd, TIMER_DEVICE_CHANGE);
+
+            // Enter the GUI eject state without starting a backend worker. This
+            // verifies real timer scheduling without opening any disk or volume.
+            {
+                let app = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const App);
+                let mut state = app.state.borrow_mut();
+                let device = Device::new(
+                    "USB\\TEST".into(),
+                    "test-container".into(),
+                    "USBSTOR".into(),
+                    "test-device".into(),
+                    Vec::new(),
+                    Vec::new(),
+                );
+                let id = device.public_id.clone();
+                let generation = state.begin_refresh().unwrap();
+                state.finish_refresh(
+                    generation,
+                    Ok(vec![ListedDevice {
+                        device,
+                        eligibility: Ok(()),
+                    }]),
+                );
+                assert!(state.select(&id));
+                assert!(state.begin_eject().is_some());
+            }
+            SendMessageW(hwnd, WM_DEVICECHANGE, DBT_DEVICEQUERYREMOVE as usize, 0);
+            SendMessageW(hwnd, WM_DEVICECHANGE, DBT_DEVICEQUERYREMOVEFAILED as usize, 0);
+            let own_failed_refresh_scheduled = KillTimer(hwnd, TIMER_DEVICE_CHANGE);
+            let during_own_failed_query = test_state(hwnd);
+            {
+                let app = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const App);
+                app.queue.lock().unwrap().push_back(WorkerMessage::Eject(
+                    Err(BackendError("test refusal".into())),
+                    Some("test diagnostics".into()),
+                ));
+                app.drain_results(hwnd);
+            }
+            let completion_refresh_scheduled = KillTimer(hwnd, TIMER_AFTER_EJECT);
+            SendMessageW(hwnd, WM_DEVICECHANGE, DBT_DEVICEARRIVAL as usize, 0);
+            let arrival_refresh_scheduled = KillTimer(hwnd, TIMER_DEVICE_CHANGE);
             let destroyed = DestroyWindow(hwnd);
             let unregistered = UnregisterClassW(class_name.as_ptr(), instance);
 
             assert!(transferred);
             assert_eq!(
                 String::from_utf16_lossy(&text[..text_length as usize]),
-                "USB 安全弹出工具"
+                expected_title
             );
             assert_eq!(query_result, 1);
             assert_eq!(after_query, (true, false));
@@ -951,6 +1024,11 @@ mod tests {
             assert_eq!(after_failed, (false, false));
             assert_eq!(after_pending, (true, false));
             assert_eq!(after_complete, (false, false));
+            assert_ne!(removal_refresh_scheduled, 0);
+            assert_eq!(own_failed_refresh_scheduled, 0);
+            assert_eq!(during_own_failed_query, (false, true));
+            assert_ne!(completion_refresh_scheduled, 0);
+            assert_ne!(arrival_refresh_scheduled, 0);
             assert_ne!(destroyed, 0);
             assert_ne!(unregistered, 0);
         }

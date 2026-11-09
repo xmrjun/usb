@@ -19,7 +19,10 @@ pub struct GuiRow {
 enum Operation {
     #[default]
     Idle,
-    Refreshing(u64),
+    Refreshing {
+        generation: u64,
+        background: bool,
+    },
     Confirming(Box<Device>),
     Ejecting,
     Elevating,
@@ -36,6 +39,7 @@ pub struct GuiState {
     closed: bool,
     status: String,
     operation_details: Option<String>,
+    last_eject_status: Option<String>,
 }
 
 impl GuiState {
@@ -47,12 +51,28 @@ impl GuiState {
     }
 
     pub fn begin_refresh(&mut self) -> Option<u64> {
+        self.begin_refresh_with_mode(false)
+    }
+
+    pub fn begin_background_refresh(&mut self) -> Option<u64> {
+        self.begin_refresh_with_mode(true)
+    }
+
+    fn begin_refresh_with_mode(&mut self, background: bool) -> Option<u64> {
         if !self.can_refresh() {
             return None;
         }
+        if !background {
+            self.last_eject_status = None;
+        }
         self.generation = self.generation.wrapping_add(1);
-        self.operation = Operation::Refreshing(self.generation);
-        self.status = "正在刷新设备列表…".into();
+        self.operation = Operation::Refreshing {
+            generation: self.generation,
+            background,
+        };
+        if self.last_eject_status.is_none() {
+            self.status = "正在刷新设备列表…".into();
+        }
         Some(self.generation)
     }
 
@@ -61,12 +81,18 @@ impl GuiState {
         generation: u64,
         result: Result<Vec<ListedDevice>, BackendError>,
     ) {
-        if self.closed
-            || !matches!(self.operation, Operation::Refreshing(active) if active == generation)
-        {
+        if self.closed {
             return;
         }
+        let background = match self.operation {
+            Operation::Refreshing {
+                generation: active,
+                background,
+            } if active == generation => background,
+            _ => return,
+        };
         self.operation = Operation::Idle;
+        let mut refresh_problem = None;
         match result {
             Ok(devices) => {
                 if self.selected_id.as_ref().is_some_and(|selected| {
@@ -87,6 +113,15 @@ impl GuiState {
                 self.devices.clear();
                 self.selected_id = None;
                 self.status = format!("刷新失败：{problem}");
+                refresh_problem = Some(problem);
+            }
+        }
+        if background {
+            if let Some(previous) = &self.last_eject_status {
+                self.status = match refresh_problem {
+                    Some(problem) => format!("{previous}\n设备列表刷新失败：{problem}"),
+                    None => previous.clone(),
+                };
             }
         }
     }
@@ -127,7 +162,7 @@ impl GuiState {
                     },
                     partitions: item.device.partition_count().to_string(),
                     status: match &item.eligibility {
-                        Ok(()) => "可以安全弹出".into(),
+                        Ok(()) => "就绪（尚未弹出）".into(),
                         Err(reason) => format!("已阻止弹出：{reason}"),
                     },
                     eligible: item.eligibility.is_ok(),
@@ -184,6 +219,7 @@ impl GuiState {
         // The modal dialog pumps window messages. Reserve the operation before
         // opening it, and keep exactly the device/impact shown to the user.
         self.operation = Operation::Confirming(Box::new(device));
+        self.last_eject_status = None;
         self.status = "请确认要安全弹出的设备。".into();
         Some(text)
     }
@@ -206,6 +242,7 @@ impl GuiState {
             return None;
         }
         self.operation = Operation::Ejecting;
+        self.last_eject_status = None;
         self.operation_details = None;
         self.status = "正在重新核对设备身份并请求安全弹出…".into();
         Some(*device)
@@ -217,6 +254,7 @@ impl GuiState {
         }
         let device = self.selected_device()?.clone();
         self.operation = Operation::Ejecting;
+        self.last_eject_status = None;
         self.operation_details = None;
         self.status = "正在重新核对设备身份并请求安全弹出…".into();
         Some(device)
@@ -236,6 +274,7 @@ impl GuiState {
             Ok(EjectResult::Rejected(failure)) => failure.user_message(),
             Err(problem) => format!("未能完成安全弹出：{problem}"),
         };
+        self.last_eject_status = Some(self.status.clone());
     }
 
     pub fn close(&mut self) {
@@ -287,6 +326,7 @@ impl GuiState {
             return false;
         }
         self.operation = Operation::Elevating;
+        self.last_eject_status = None;
         self.status = "正在请求管理员权限，请在系统提示中确认。".into();
         true
     }
@@ -313,13 +353,17 @@ impl GuiState {
         !matches!(self.operation, Operation::Idle)
     }
 
+    pub fn is_ejecting(&self) -> bool {
+        matches!(self.operation, Operation::Ejecting)
+    }
+
     pub fn can_refresh(&self) -> bool {
         !self.closed && !self.is_busy() && !self.removal_pending
     }
 
     pub fn removal_started(&mut self) {
         self.removal_pending = true;
-        if !self.is_busy() {
+        if !self.is_busy() && self.last_eject_status.is_none() {
             self.status = "设备正在被移除，已暂停刷新。".into();
         }
     }
@@ -342,4 +386,43 @@ impl GuiState {
 }
 
 #[cfg(windows)]
+pub(crate) fn window_title(elevated: bool) -> String {
+    window_title_for_build(elevated, option_env!("USB_EJECTOR_BUILD_ID"))
+}
+
+#[cfg(any(windows, test))]
+fn window_title_for_build(elevated: bool, build_id: Option<&str>) -> String {
+    let privilege = if elevated { "管理员" } else { "普通权限" };
+    let build = match build_id.map(str::trim) {
+        Some(id) if !id.is_empty() && !id.eq_ignore_ascii_case("unknown") => {
+            format!("构建 {}", id.chars().take(12).collect::<String>())
+        }
+        _ => "开发构建".into(),
+    };
+    format!("USB 安全弹出工具（{privilege}；{build}）")
+}
+
+#[cfg(windows)]
 pub mod native;
+
+#[cfg(test)]
+mod title_tests {
+    use super::window_title_for_build;
+
+    #[test]
+    fn title_identifies_the_build_and_privilege_without_unknown_placeholders() {
+        assert_eq!(
+            window_title_for_build(
+                true,
+                Some("db87533d54a39f7a6a9cc2b7a77d43dd20aa8d96")
+            ),
+            "USB 安全弹出工具（管理员；构建 db87533d54a3）"
+        );
+        for build_id in [None, Some(""), Some("  "), Some("unknown")] {
+            assert_eq!(
+                window_title_for_build(false, build_id),
+                "USB 安全弹出工具（普通权限；开发构建）"
+            );
+        }
+    }
+}

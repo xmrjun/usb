@@ -170,17 +170,16 @@ pub(super) fn locate_revalidated_target(
             "the eject target is no longer a removable USB devnode".into(),
         ));
     }
-    if has_removable_usb_ancestor(devinst)? {
-        return Err(BackendError(
-            "the eject target no longer has a unique removable USB root".into(),
-        ));
-    }
     let disk_id = expected
         .disks
         .first()
         .map(|disk| disk.instance_id.as_str())
         .ok_or_else(|| BackendError("the selected device has no validated disk".into()))?;
-    let actual = inspect_target(devinst, disk_id)?;
+    // Apply the same hub boundary as discovery. A removable parent hub is a
+    // connection boundary, never a second eject target or part of our impact.
+    let (actual, resolved_devinst) = resolve_target(devinst, disk_id)?.ok_or_else(|| {
+        BackendError("the eject target no longer has a validated USB hub boundary".into())
+    })?;
     let expected_disk_ids = expected
         .disks
         .iter()
@@ -191,9 +190,10 @@ pub(super) fn locate_revalidated_target(
         .iter()
         .map(|id| id.to_uppercase())
         .collect::<BTreeSet<_>>();
-    if !actual
-        .instance_id
-        .eq_ignore_ascii_case(&expected.target_instance_id)
+    if resolved_devinst != devinst
+        || !actual
+            .instance_id
+            .eq_ignore_ascii_case(&expected.target_instance_id)
         || !actual
             .container_id
             .eq_ignore_ascii_case(&expected.target_container_id)
@@ -1019,45 +1019,95 @@ fn resolve_target(
     devinst: u32,
     disk_instance_id: &str,
 ) -> Result<Option<(Target, u32)>, BackendError> {
+    resolve_target_with(
+        devinst,
+        disk_instance_id,
+        ancestor_properties,
+        parent_devinst,
+        inspect_target,
+    )
+}
+
+struct AncestorProperties {
+    enumerator: String,
+    service: String,
+    capabilities: u32,
+}
+
+impl AncestorProperties {
+    fn is_usb_hub(&self) -> bool {
+        self.enumerator.eq_ignore_ascii_case("USB")
+            && matches!(
+                self.service.to_ascii_lowercase().as_str(),
+                "usbhub" | "usbhub3"
+            )
+    }
+}
+
+fn ancestor_properties(devinst: u32) -> Result<AncestorProperties, BackendError> {
+    Ok(AncestorProperties {
+        enumerator: devnode_string(devinst, CM_DRP_ENUMERATOR_NAME)?,
+        service: devnode_string(devinst, CM_DRP_SERVICE)?,
+        capabilities: devnode_dword(devinst, CM_DRP_CAPABILITIES)?,
+    })
+}
+
+fn parent_devinst(devinst: u32) -> Result<Option<u32>, BackendError> {
+    let mut parent = 0_u32;
+    // SAFETY: parent is writable and devinst is a local devnode obtained from SetupAPI/CM.
+    let result = unsafe { CM_Get_Parent(&mut parent, devinst, 0) };
+    match result {
+        CR_SUCCESS => Ok(Some(parent)),
+        CR_NO_SUCH_DEVNODE => Ok(None),
+        _ => Err(BackendError(format!(
+            "CM_Get_Parent failed with CONFIGRET {result}"
+        ))),
+    }
+}
+
+fn resolve_target_with<P, A, I>(
+    devinst: u32,
+    disk_instance_id: &str,
+    mut properties: P,
+    mut parent: A,
+    mut inspect: I,
+) -> Result<Option<(Target, u32)>, BackendError>
+where
+    P: FnMut(u32) -> Result<AncestorProperties, BackendError>,
+    A: FnMut(u32) -> Result<Option<u32>, BackendError>,
+    I: FnMut(u32, &str) -> Result<Target, BackendError>,
+{
     let mut current = devinst;
     let mut path_complete = true;
+    let mut hub_boundary_found = false;
     let mut candidates = Vec::new();
     for _ in 0..MAX_TOPOLOGY_DEPTH {
-        let enumerator = devnode_string(current, CM_DRP_ENUMERATOR_NAME);
-        let capabilities = devnode_dword(current, CM_DRP_CAPABILITIES);
-        match (enumerator, capabilities) {
-            (Ok(enumerator), Ok(capabilities))
-                if enumerator.eq_ignore_ascii_case("USB")
-                    && capabilities & CM_DEVCAP_REMOVABLE != 0 =>
-            {
-                let mut target = inspect_target(current, disk_instance_id)?;
-                target.topology_complete &= path_complete;
-                candidates.push((target, current));
+        match properties(current) {
+            Ok(node) if node.is_usb_hub() => {
+                // Stop before inspecting a hub as an eject candidate, regardless
+                // of its removable bit. Devices beyond it are outside this target.
+                hub_boundary_found = true;
+                break;
             }
-            (Err(_), _) | (_, Err(_)) => path_complete = false,
+            Ok(node)
+                if node.enumerator.eq_ignore_ascii_case("USB")
+                    && node.capabilities & CM_DEVCAP_REMOVABLE != 0 =>
+            {
+                candidates.push((inspect(current, disk_instance_id)?, current));
+            }
+            Err(_) => path_complete = false,
             _ => {}
         }
-        let mut parent = 0_u32;
-        // SAFETY: parent is writable and current is a local devnode obtained from SetupAPI/CM.
-        let result = unsafe { CM_Get_Parent(&mut parent, current, 0) };
-        if result == CR_NO_SUCH_DEVNODE {
+        let Some(next) = parent(current)? else {
             break;
-        }
-        if result != CR_SUCCESS {
-            return Err(BackendError(format!(
-                "CM_Get_Parent failed with CONFIGRET {result}"
-            )));
-        }
-        current = parent;
+        };
+        current = next;
     }
-    if candidates.len() != 1 {
-        if let Some((mut target, devinst)) = candidates.into_iter().next() {
-            target.topology_complete = false;
-            return Ok(Some((target, devinst)));
-        }
-        return Ok(None);
-    }
-    Ok(candidates.pop())
+    let unique = candidates.len() == 1;
+    Ok(candidates.into_iter().next().map(|(mut target, devinst)| {
+        target.topology_complete &= path_complete && hub_boundary_found && unique;
+        (target, devinst)
+    }))
 }
 
 fn inspect_target(target: u32, disk_instance_id: &str) -> Result<Target, BackendError> {
@@ -1088,45 +1138,10 @@ fn inspect_target(target: u32, disk_instance_id: &str) -> Result<Target, Backend
 }
 
 fn parent_is_hub(devinst: u32) -> bool {
-    let mut parent = 0_u32;
-    // SAFETY: parent is writable and devinst is a local devnode.
-    if unsafe { CM_Get_Parent(&mut parent, devinst, 0) } != CR_SUCCESS {
-        return false;
-    }
-    let Ok(service) = devnode_string(parent, CM_DRP_SERVICE) else {
+    let Ok(Some(parent)) = parent_devinst(devinst) else {
         return false;
     };
-    let Ok(enumerator) = devnode_string(parent, CM_DRP_ENUMERATOR_NAME) else {
-        return false;
-    };
-    matches!(service.to_ascii_lowercase().as_str(), "usbhub" | "usbhub3")
-        && enumerator.eq_ignore_ascii_case("USB")
-}
-
-fn has_removable_usb_ancestor(devinst: u32) -> Result<bool, BackendError> {
-    let mut current = devinst;
-    for _ in 0..MAX_TOPOLOGY_DEPTH {
-        let mut parent = 0_u32;
-        // SAFETY: parent is writable and current is a local devnode.
-        let result = unsafe { CM_Get_Parent(&mut parent, current, 0) };
-        if result == CR_NO_SUCH_DEVNODE {
-            return Ok(false);
-        }
-        if result != CR_SUCCESS {
-            return Err(BackendError(format!(
-                "CM_Get_Parent failed with CONFIGRET {result}"
-            )));
-        }
-        let enumerator = devnode_string(parent, CM_DRP_ENUMERATOR_NAME)?;
-        let capabilities = devnode_dword(parent, CM_DRP_CAPABILITIES)?;
-        if enumerator.eq_ignore_ascii_case("USB") && capabilities & CM_DEVCAP_REMOVABLE != 0 {
-            return Ok(true);
-        }
-        current = parent;
-    }
-    Err(BackendError(
-        "PnP ancestor depth exceeded the safety limit".into(),
-    ))
+    ancestor_properties(parent).is_ok_and(|node| node.is_usb_hub())
 }
 
 fn is_storage_transport_service(service: &str) -> bool {
@@ -1496,11 +1511,14 @@ fn wide(value: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{assemble_snapshot, DiskEnumeration, ScanDiagnostics, VolumeEnumeration};
+    use super::{
+        assemble_snapshot, is_storage_transport_service, resolve_target_with, AncestorProperties,
+        DiskEnumeration, ScanDiagnostics, VolumeEnumeration, MAX_TOPOLOGY_DEPTH,
+    };
     use crate::{
         backend::BackendError,
-        model::Disk,
-        policy::{BlockReason, BusType, DiskCandidate},
+        model::{Disk, Partition, Volume, VolumeExtent},
+        policy::{evaluate_inventory, BlockReason, BusType, DiskCandidate, Inventory, Target},
     };
     use std::collections::BTreeSet;
 
@@ -1575,5 +1593,173 @@ mod tests {
         assert!(problem.0.contains("disk interface 2"));
         assert!(problem.0.contains("0x000700a0"));
         assert!(problem.0.contains("Win32 error 5"));
+    }
+
+    type TestAncestor<'a> = Option<(&'a str, &'a str, u32)>;
+
+    fn test_properties(node: TestAncestor<'_>) -> Result<AncestorProperties, BackendError> {
+        let (enumerator, service, capabilities) =
+            node.ok_or_else(|| BackendError("simulated missing ancestor property".into()))?;
+        Ok(AncestorProperties {
+            enumerator: enumerator.into(),
+            service: service.into(),
+            capabilities,
+        })
+    }
+
+    fn resolve_test_path(
+        path: &[TestAncestor<'_>],
+        start: u32,
+        inspected: &mut Vec<u32>,
+    ) -> Option<(Target, u32)> {
+        resolve_target_with(
+            start,
+            r"USBSTOR\test-7",
+            |node| test_properties(path[node as usize]),
+            |node| Ok((node as usize + 1 < path.len()).then_some(node + 1)),
+            |node, disk_id| {
+                inspected.push(node);
+                let properties = test_properties(path[node as usize])?;
+                assert!(
+                    !properties.is_usb_hub(),
+                    "a hub must never be an eject candidate"
+                );
+                let parent_is_valid_hub =
+                    path.get(node as usize + 1).copied().is_some_and(|parent| {
+                        test_properties(parent).is_ok_and(|info| info.is_usb_hub())
+                    });
+                Ok(Target {
+                    instance_id: format!(r"USB\target-{node}"),
+                    container_id: format!("{{container-{node}}}"),
+                    name: "Test USB".into(),
+                    removable: true,
+                    topology_complete: true,
+                    is_hub: false,
+                    has_non_storage_descendants: !is_storage_transport_service(
+                        &properties.service,
+                    ),
+                    parent_is_valid_hub,
+                    descendant_disk_instance_ids: BTreeSet::from([disk_id.into()]),
+                    service: properties.service,
+                })
+            },
+        )
+        .unwrap()
+    }
+
+    fn eligibility(target: Target) -> Result<(), BlockReason> {
+        let inventory = Inventory {
+            disks: vec![DiskCandidate {
+                disk: Disk {
+                    instance_id: r"USBSTOR\test-7".into(),
+                    number: 7,
+                    name: "Test USB disk".into(),
+                    serial: "test-7".into(),
+                    capacity_bytes: 8_000_000_000,
+                    partition_count: 1,
+                    partitions: vec![Partition {
+                        number: 1,
+                        starting_offset: 1_048_576,
+                        length: 4_000_000,
+                    }],
+                    partition_table_supported: true,
+                },
+                bus_type: BusType::Usb,
+                target: Some(target),
+            }],
+            volumes: vec![Volume {
+                id: r"\\?\Volume{test-7}\".into(),
+                mount_paths: vec![r"H:\".into()],
+                capacity_bytes: Some(4_000_000),
+                filesystem: Some("exFAT".into()),
+                disk_numbers: vec![7],
+                extents: vec![VolumeExtent {
+                    disk_number: 7,
+                    starting_offset: 1_048_576,
+                    extent_length: 4_000_000,
+                }],
+                mapping_complete: true,
+            }],
+            critical_disk_numbers: BTreeSet::new(),
+            critical_scan_complete: true,
+            virtual_dependency_scan_complete: true,
+            virtual_host_volume_ids: BTreeSet::new(),
+            complete: true,
+        };
+        let mut listed = evaluate_inventory(inventory);
+        assert_eq!(listed.len(), 1);
+        listed.remove(0).eligibility
+    }
+
+    #[test]
+    fn discovery_and_revalidation_stop_below_removable_usb_hubs() {
+        for service in ["USBSTOR", "UASPStor"] {
+            for hub_service in ["USBHUB", "USBHUB3"] {
+                for hub_capabilities in [0x80, 0x84] {
+                    let path = [
+                        Some(("USBSTOR", "disk", 0x10)),
+                        Some(("USB", service, 0x94)),
+                        Some(("USB", hub_service, hub_capabilities)),
+                        // Unknown nodes above the verified hub are not inspected.
+                        None,
+                    ];
+                    let mut inspected = Vec::new();
+                    let (discovered, node) = resolve_test_path(&path, 0, &mut inspected).unwrap();
+                    assert_eq!(node, 1);
+                    assert_eq!(inspected, vec![1]);
+                    assert_eq!(eligibility(discovered.clone()), Ok(()));
+
+                    inspected.clear();
+                    let (revalidated, node) = resolve_test_path(&path, 1, &mut inspected).unwrap();
+                    assert_eq!(node, 1);
+                    assert_eq!(inspected, vec![1]);
+                    assert_eq!(revalidated, discovered);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn composite_and_unknown_nodes_below_the_hub_remain_blocked() {
+        for ancestor in [
+            Some(("USB", "usbccgp", 0x84)),
+            Some(("USB", "usbccgp", 0x80)),
+            Some(("USB", "unknown", 0x80)),
+            Some(("SWD", "USBHUB3", 0x84)),
+            None,
+        ] {
+            let path = [
+                Some(("USBSTOR", "disk", 0x10)),
+                Some(("USB", "USBSTOR", 0x94)),
+                ancestor,
+                Some(("USB", "USBHUB3", 0x84)),
+            ];
+            let mut inspected = Vec::new();
+            let (target, node) = resolve_test_path(&path, 0, &mut inspected).unwrap();
+            assert_eq!(node, 1);
+            assert!(!inspected.contains(&3));
+            assert_eq!(eligibility(target), Err(BlockReason::TopologyIncomplete));
+        }
+    }
+
+    #[test]
+    fn missing_or_unreached_hub_boundary_never_approves_a_target() {
+        let mut path = vec![
+            Some(("USBSTOR", "disk", 0x10)),
+            Some(("USB", "USBSTOR", 0x94)),
+        ];
+        let (target, _) = resolve_test_path(&path, 0, &mut Vec::new()).unwrap();
+        assert_eq!(eligibility(target), Err(BlockReason::TopologyIncomplete));
+
+        path.resize(MAX_TOPOLOGY_DEPTH + 1, Some(("OTHER", "unknown", 0)));
+        path.push(Some(("USB", "USBHUB3", 0x84)));
+        let (target, _) = resolve_test_path(&path, 0, &mut Vec::new()).unwrap();
+        assert!(!target.topology_complete);
+        assert_eq!(eligibility(target), Err(BlockReason::TopologyIncomplete));
+
+        let only_hub = [Some(("USB", "USBHUB3", 0x84))];
+        let mut inspected = Vec::new();
+        assert!(resolve_test_path(&only_hub, 0, &mut inspected).is_none());
+        assert!(inspected.is_empty());
     }
 }

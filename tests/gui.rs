@@ -55,7 +55,8 @@ fn rows_show_name_mount_capacity_partitions_and_status() {
     assert_eq!(rows[0].mounts, r"E:\ [逻辑卷：15.5 GB]");
     assert_eq!(rows[0].capacity, "16.0 GB");
     assert_eq!(rows[0].partitions, "1");
-    assert_eq!(rows[0].status, "可以安全弹出");
+    assert_eq!(rows[0].status, "就绪（尚未弹出）");
+    assert!(rows[0].eligible);
 }
 
 #[test]
@@ -311,4 +312,85 @@ fn elevation_reserves_the_window_and_success_prevents_queued_work() {
     assert!(state.request_close());
     assert!(state.begin_refresh().is_none());
     assert!(!state.begin_elevation());
+}
+
+#[test]
+fn background_device_changes_update_rows_without_erasing_the_eject_failure() {
+    let mut state = GuiState::new();
+    let listed = device("A", r"G:\");
+    let id = listed.device.public_id.clone();
+    let generation = state.begin_refresh().unwrap();
+    state.finish_refresh(generation, Ok(vec![listed]));
+    assert!(state.select(&id));
+    assert!(state.begin_eject().is_some());
+    assert!(state.begin_background_refresh().is_none());
+    state.set_operation_details(Some("CONFIGRET=23; veto=5; name=test-volume".into()));
+    state.finish_eject(Ok(EjectResult::Rejected(EjectFailure {
+        config_ret: 23,
+        veto: Some((VetoKind::OutstandingOpen, "test-volume".into())),
+    })));
+    let failure = state.status().to_owned();
+
+    // Removal notifications must not temporarily replace the rejection either.
+    state.removal_started();
+    assert_eq!(state.status(), failure);
+    state.removal_finished();
+    let background = state.begin_background_refresh().unwrap();
+    assert_eq!(state.status(), failure);
+    state.finish_refresh(background, Ok(vec![device("B", r"H:\")]));
+    assert_eq!(state.status(), failure);
+    assert_eq!(state.selected_id(), None);
+    assert_eq!(state.rows()[0].name, "USB Device B");
+    assert_eq!(
+        state.operation_details(),
+        Some("CONFIGRET=23; veto=5; name=test-volume")
+    );
+}
+
+#[test]
+fn failed_background_refresh_preserves_the_operation_error_until_manual_refresh() {
+    let mut state = GuiState::new();
+    let listed = device("A", r"G:\");
+    let id = listed.device.public_id.clone();
+    let generation = state.begin_refresh().unwrap();
+    state.finish_refresh(generation, Ok(vec![listed.clone()]));
+    state.select(&id);
+    assert!(state.begin_eject().is_some());
+    state.set_operation_details(Some("FSCTL_LOCK_VOLUME failed: Win32 32".into()));
+    state.finish_eject(Err(BackendError("锁卷失败 Win32 32".into())));
+
+    let background = state.begin_background_refresh().unwrap();
+    state.finish_refresh(background, Err(BackendError("枚举失败 Win32 5".into())));
+    assert!(state.status().contains("锁卷失败 Win32 32"));
+    assert!(state.status().contains("枚举失败 Win32 5"));
+    assert!(state.rows().is_empty());
+    assert_eq!(
+        state.operation_details(),
+        Some("FSCTL_LOCK_VOLUME failed: Win32 32")
+    );
+
+    let manual = state.begin_refresh().unwrap();
+    state.finish_refresh(manual, Ok(vec![listed]));
+    assert_eq!(state.status(), "已发现 1 个 USB 物理设备。");
+    assert_eq!(
+        state.operation_details(),
+        Some("FSCTL_LOCK_VOLUME failed: Win32 32")
+    );
+}
+
+#[test]
+fn successful_eject_keeps_its_result_when_the_completion_refresh_removes_the_row() {
+    let mut state = GuiState::new();
+    let listed = device("A", r"G:\");
+    let id = listed.device.public_id.clone();
+    let generation = state.begin_refresh().unwrap();
+    state.finish_refresh(generation, Ok(vec![listed]));
+    state.select(&id);
+    assert!(state.begin_eject().is_some());
+    state.finish_eject(Ok(EjectResult::Ejected));
+    let background = state.begin_background_refresh().unwrap();
+    state.finish_refresh(background, Ok(vec![]));
+    assert!(state.rows().is_empty());
+    assert!(!state.can_eject());
+    assert_eq!(state.status(), "Windows 已接受安全弹出请求。");
 }

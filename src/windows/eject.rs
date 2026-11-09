@@ -33,7 +33,8 @@ pub(super) fn request_eject(
         diagnostics,
         started,
         &format!(
-            "开始安全弹出; target={}; service={}; fingerprint={}",
+            "开始安全弹出; build={}; target={}; service={}; fingerprint={}",
+            option_env!("USB_EJECTOR_BUILD_ID").unwrap_or("development"),
             expected.target_instance_id,
             expected.target_service,
             expected.fingerprint()
