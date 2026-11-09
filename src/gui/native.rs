@@ -9,7 +9,7 @@ use std::sync::{
 };
 
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
+    Foundation::{GetLastError, SetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM},
     Graphics::Gdi::{
         CreateFontW, DeleteObject, GetStockObject, UpdateWindow, CLEARTYPE_QUALITY,
         CLIP_DEFAULT_PRECIS, COLOR_WINDOW, DEFAULT_CHARSET, DEFAULT_GUI_FONT, DEFAULT_PITCH,
@@ -31,7 +31,9 @@ use windows_sys::Win32::{
             GetMessageW, GetWindowLongPtrW, KillTimer, LoadCursorW, MessageBoxW, MoveWindow,
             PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW, SetTimer,
             SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, BN_CLICKED,
-            BS_PUSHBUTTON, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA,
+            BS_PUSHBUTTON, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+            DBT_DEVICEARRIVAL, DBT_DEVICEQUERYREMOVE, DBT_DEVICEQUERYREMOVEFAILED,
+            DBT_DEVICEREMOVECOMPLETE, DBT_DEVICEREMOVEPENDING, DBT_DEVNODES_CHANGED, GWLP_USERDATA,
             IDC_ARROW, IDYES, MB_ICONWARNING, MB_YESNO, MSG, SW_SHOWDEFAULT, WM_APP, WM_CLOSE,
             WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DEVICECHANGE, WM_NCCREATE, WM_NCDESTROY,
             WM_NOTIFY, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD, WS_EX_CLIENTEDGE,
@@ -291,10 +293,10 @@ impl App {
     }
 
     fn update_controls(&self) {
-        let (busy, can_eject, status_text) = {
+        let (can_refresh, can_eject, status_text) = {
             let state = self.state.borrow();
             (
-                state.is_busy(),
+                state.can_refresh(),
                 state.can_eject(),
                 state.status().to_owned(),
             )
@@ -304,7 +306,7 @@ impl App {
         let status = self.status.get();
         // SAFETY: controls are live while App is attached to the window.
         unsafe {
-            EnableWindow(refresh, (!busy) as i32);
+            EnableWindow(refresh, can_refresh as i32);
             EnableWindow(eject, can_eject as i32);
             let status_text = wide(&status_text);
             SetWindowTextW(status, status_text.as_ptr());
@@ -456,17 +458,34 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
         // SAFETY: lparam is CREATESTRUCTW for WM_NCCREATE and lpCreateParams points to the
         // pending Option<Box<App>> that remains live during synchronous CreateWindowExW.
         let create = unsafe { &*(lparam as *const CREATESTRUCTW) };
-        // SAFETY: the pending pointer is valid and uniquely borrowed during window creation.
-        let pending = unsafe { &mut *(create.lpCreateParams as *mut Option<Box<App>>) };
+        let pending_pointer = create.lpCreateParams as *mut Option<Box<App>>;
+        if pending_pointer.is_null() {
+            return 0;
+        }
+        // SAFETY: preserve default non-client initialization, including the
+        // window title. No App reference or pending borrow crosses this call.
+        let accepted = unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+        if accepted == 0 {
+            return 0;
+        }
+        // SAFETY: the caller's pending Box is live throughout CreateWindowExW.
+        let pending = unsafe { &mut *pending_pointer };
         let Some(app) = pending.take() else {
             return 0;
         };
         let app_pointer = Box::into_raw(app);
-        // SAFETY: the window now owns the Box and reclaims it during WM_NCDESTROY.
+        // SAFETY: attach the unique Box only after default creation succeeds.
+        // A zero return is valid when replacing initially empty user data.
         unsafe {
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, app_pointer as isize);
+            SetLastError(0);
+            let previous = SetWindowLongPtrW(hwnd, GWLP_USERDATA, app_pointer as isize);
+            if previous == 0 && GetLastError() != 0 {
+                *pending = Some(Box::from_raw(app_pointer));
+                return 0;
+            }
         }
-        return 1;
+        // WM_NCDESTROY now owns the only remaining Box reclamation path.
+        return accepted;
     }
 
     // SAFETY: the value was stored during WM_NCCREATE and remains valid until WM_NCDESTROY.
@@ -499,8 +518,9 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
                 match id {
                     ID_REFRESH => app.start_refresh(hwnd),
                     ID_EJECT => {
-                        let confirmation = app.state.borrow().confirmation_text();
+                        let confirmation = app.state.borrow_mut().begin_confirmation();
                         if let Some(text) = confirmation {
+                            app.update_controls();
                             let text = wide(&text);
                             let caption = wide("确认安全弹出");
                             // SAFETY: window and NUL-terminated strings are valid.
@@ -512,11 +532,14 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
                                     MB_YESNO | MB_ICONWARNING,
                                 )
                             };
-                            if answer == IDYES {
-                                let device = app.state.borrow_mut().begin_eject();
-                                if let Some(device) = device {
-                                    app.start_eject(hwnd, device);
-                                }
+                            let device = app
+                                .state
+                                .borrow_mut()
+                                .finish_confirmation(answer == IDYES);
+                            if let Some(device) = device {
+                                app.start_eject(hwnd, device);
+                            } else {
+                                app.update_controls();
                             }
                         }
                     }
@@ -543,12 +566,37 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
             0
         }
         WM_DEVICECHANGE => {
-            // SAFETY: resetting a window timer is valid for this live hwnd.
-            unsafe {
-                KillTimer(hwnd, TIMER_DEVICE_CHANGE);
-                SetTimer(hwnd, TIMER_DEVICE_CHANGE, 400, None);
+            match wparam as u32 {
+                DBT_DEVICEQUERYREMOVE | DBT_DEVICEREMOVEPENDING => {
+                    app.state.borrow_mut().removal_started();
+                    // SAFETY: cancel this window's scans instead of reopening
+                    // devices while Windows is querying or performing removal.
+                    unsafe {
+                        KillTimer(hwnd, TIMER_DEVICE_CHANGE);
+                        KillTimer(hwnd, TIMER_AFTER_EJECT);
+                    }
+                    app.update_controls();
+                }
+                DBT_DEVICEQUERYREMOVEFAILED | DBT_DEVICEREMOVECOMPLETE => {
+                    app.state.borrow_mut().removal_finished();
+                    // SAFETY: removal ended; a deferred scan may update rows.
+                    unsafe {
+                        SetTimer(hwnd, TIMER_DEVICE_CHANGE, 400, None);
+                    }
+                    app.update_controls();
+                }
+                DBT_DEVICEARRIVAL | DBT_DEVNODES_CHANGED => {
+                    if !app.state.borrow().removal_pending() {
+                        // SAFETY: coalesce notifications only outside removal.
+                        unsafe {
+                            SetTimer(hwnd, TIMER_DEVICE_CHANGE, 400, None);
+                        }
+                    }
+                }
+                _ => {}
             }
-            0
+            // Grant query-remove requests; this application never vetoes them.
+            1
         }
         WM_TIMER => {
             let timer = wparam;
@@ -557,6 +605,9 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
                 KillTimer(hwnd, timer);
             }
             if timer == TIMER_DEVICE_CHANGE || timer == TIMER_AFTER_EJECT {
+                if app.state.borrow().removal_pending() {
+                    return 0;
+                }
                 let busy = app.state.borrow().is_busy();
                 if busy {
                     // SAFETY: defer until the current worker finishes.
@@ -712,4 +763,103 @@ fn set_item_text(list: HWND, row: i32, column: i32, text: &str) {
 
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowTextW, UnregisterClassW};
+
+    unsafe extern "system" fn test_window_proc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if matches!(
+            message,
+            WM_NCCREATE | WM_NCDESTROY | WM_DEVICECHANGE | WM_TIMER
+        ) {
+            // SAFETY: dispatch genuine Windows messages to the production
+            // handler, excluding WM_CREATE so this test never scans disks.
+            unsafe { window_proc_inner(hwnd, message, wparam, lparam) }
+        } else {
+            // SAFETY: default handling for this test window's other messages.
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        }
+    }
+
+    fn test_state(hwnd: HWND) -> (bool, bool) {
+        // SAFETY: this test reads state only while its created window is live;
+        // no App reference is retained across another window API call.
+        let app = unsafe { &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const App) };
+        let state = app.state.borrow();
+        (state.removal_pending(), state.is_busy())
+    }
+
+    #[test]
+    fn native_window_preserves_title_and_suspends_scans_during_removal() {
+        let class_name = wide("UsbEjectorNativeRegressionWindow");
+        let title = wide("USB 安全弹出工具");
+        let mut pending = Some(Box::new(App::new()));
+        // SAFETY: buffers and the pending Box outlive synchronous creation;
+        // the hidden test window is destroyed before its class is unregistered.
+        unsafe {
+            let instance = GetModuleHandleW(null());
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(test_window_proc),
+                hInstance: instance,
+                lpszClassName: class_name.as_ptr(),
+                ..zeroed()
+            };
+            assert_ne!(RegisterClassW(&class), 0);
+            let hwnd = CreateWindowExW(
+                0,
+                class_name.as_ptr(),
+                title.as_ptr(),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                400,
+                200,
+                null_mut(),
+                null_mut(),
+                instance,
+                (&mut pending as *mut Option<Box<App>>).cast(),
+            );
+            assert!(!hwnd.is_null());
+            let transferred = pending.is_none();
+            let mut text = [0_u16; 128];
+            let text_length = GetWindowTextW(hwnd, text.as_mut_ptr(), text.len() as i32);
+            let query_result =
+                SendMessageW(hwnd, WM_DEVICECHANGE, DBT_DEVICEQUERYREMOVE as usize, 0);
+            let after_query = test_state(hwnd);
+            SendMessageW(hwnd, WM_DEVICECHANGE, DBT_DEVICEARRIVAL as usize, 0);
+            SendMessageW(hwnd, WM_DEVICECHANGE, DBT_DEVNODES_CHANGED as usize, 0);
+            SendMessageW(hwnd, WM_TIMER, TIMER_DEVICE_CHANGE, 0);
+            let after_unrelated_events = test_state(hwnd);
+            SendMessageW(hwnd, WM_DEVICECHANGE, DBT_DEVICEQUERYREMOVEFAILED as usize, 0);
+            let after_failed = test_state(hwnd);
+            SendMessageW(hwnd, WM_DEVICECHANGE, DBT_DEVICEREMOVEPENDING as usize, 0);
+            let after_pending = test_state(hwnd);
+            SendMessageW(hwnd, WM_DEVICECHANGE, DBT_DEVICEREMOVECOMPLETE as usize, 0);
+            let after_complete = test_state(hwnd);
+            let destroyed = DestroyWindow(hwnd);
+            let unregistered = UnregisterClassW(class_name.as_ptr(), instance);
+
+            assert!(transferred);
+            assert_eq!(
+                String::from_utf16_lossy(&text[..text_length as usize]),
+                "USB 安全弹出工具"
+            );
+            assert_eq!(query_result, 1);
+            assert_eq!(after_query, (true, false));
+            assert_eq!(after_unrelated_events, (true, false));
+            assert_eq!(after_failed, (false, false));
+            assert_eq!(after_pending, (true, false));
+            assert_eq!(after_complete, (false, false));
+            assert_ne!(destroyed, 0);
+            assert_ne!(unregistered, 0);
+        }
+    }
 }

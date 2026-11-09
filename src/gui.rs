@@ -16,11 +16,21 @@ pub struct GuiRow {
 }
 
 #[derive(Default)]
+enum Operation {
+    #[default]
+    Idle,
+    Refreshing(u64),
+    Confirming(Box<Device>),
+    Ejecting,
+}
+
+#[derive(Default)]
 pub struct GuiState {
     devices: Vec<ListedDevice>,
     selected_id: Option<String>,
     generation: u64,
-    busy: bool,
+    operation: Operation,
+    removal_pending: bool,
     closed: bool,
     status: String,
 }
@@ -34,11 +44,11 @@ impl GuiState {
     }
 
     pub fn begin_refresh(&mut self) -> Option<u64> {
-        if self.busy || self.closed {
+        if !self.can_refresh() {
             return None;
         }
-        self.busy = true;
         self.generation = self.generation.wrapping_add(1);
+        self.operation = Operation::Refreshing(self.generation);
         self.status = "正在刷新设备列表…".into();
         Some(self.generation)
     }
@@ -48,10 +58,12 @@ impl GuiState {
         generation: u64,
         result: Result<Vec<ListedDevice>, BackendError>,
     ) {
-        if self.closed || generation != self.generation {
+        if self.closed
+            || !matches!(self.operation, Operation::Refreshing(active) if active == generation)
+        {
             return;
         }
-        self.busy = false;
+        self.operation = Operation::Idle;
         match result {
             Ok(devices) => {
                 if self.selected_id.as_ref().is_some_and(|selected| {
@@ -122,7 +134,7 @@ impl GuiState {
     }
 
     pub fn select(&mut self, public_id: &str) -> bool {
-        if self.closed || self.busy {
+        if self.closed || self.is_busy() || self.removal_pending {
             return false;
         }
         if self
@@ -142,29 +154,75 @@ impl GuiState {
     }
 
     pub fn can_eject(&self) -> bool {
-        !self.busy && !self.closed && self.selected_device().is_some()
+        self.can_refresh() && self.selected_device().is_some()
     }
 
     pub fn confirmation_text(&self) -> Option<String> {
+        if !self.can_eject() {
+            return None;
+        }
         let device = self.selected_device()?;
-        Some(format!(
+        Some(Self::device_confirmation_text(device))
+    }
+
+    fn device_confirmation_text(device: &Device) -> String {
+        format!(
             "是否请求 Windows 安全弹出以下物理设备？\n\n{}\n请先保存相关文件并关闭正在使用该设备的程序。\n本工具不会强制卸载磁盘或终止程序。",
             device.impact_summary()
-        ))
+        )
+    }
+
+    pub fn begin_confirmation(&mut self) -> Option<String> {
+        if !self.can_eject() {
+            return None;
+        }
+        let device = self.selected_device()?.clone();
+        let text = Self::device_confirmation_text(&device);
+        // The modal dialog pumps window messages. Reserve the operation before
+        // opening it, and keep exactly the device/impact shown to the user.
+        self.operation = Operation::Confirming(Box::new(device));
+        self.status = "请确认要安全弹出的设备。".into();
+        Some(text)
+    }
+
+    pub fn finish_confirmation(&mut self, accepted: bool) -> Option<Device> {
+        if self.closed || !matches!(self.operation, Operation::Confirming(_)) {
+            return None;
+        }
+        let Operation::Confirming(device) =
+            std::mem::replace(&mut self.operation, Operation::Idle)
+        else {
+            unreachable!("confirmation state checked above");
+        };
+        if self.removal_pending {
+            self.status = "设备正在被移除，已取消本次弹出确认。".into();
+            return None;
+        }
+        if !accepted {
+            self.status = "已取消安全弹出。".into();
+            return None;
+        }
+        self.operation = Operation::Ejecting;
+        self.status = "正在重新核对设备身份并请求安全弹出…".into();
+        Some(*device)
     }
 
     pub fn begin_eject(&mut self) -> Option<Device> {
+        if !self.can_eject() {
+            return None;
+        }
         let device = self.selected_device()?.clone();
-        self.busy = true;
+        self.operation = Operation::Ejecting;
         self.status = "正在重新核对设备身份并请求安全弹出…".into();
         Some(device)
     }
 
     pub fn finish_eject(&mut self, result: Result<EjectResult, BackendError>) {
-        if self.closed {
+        if self.closed || !matches!(self.operation, Operation::Ejecting) {
             return;
         }
-        self.busy = false;
+        self.operation = Operation::Idle;
+        self.removal_pending = false;
         self.status = match result {
             Ok(EjectResult::Ejected) => {
                 self.selected_id = None;
@@ -177,12 +235,12 @@ impl GuiState {
 
     pub fn close(&mut self) {
         self.closed = true;
-        self.busy = false;
+        self.operation = Operation::Idle;
         self.generation = self.generation.wrapping_add(1);
     }
 
     pub fn request_close(&mut self) -> bool {
-        if self.busy {
+        if self.is_busy() {
             self.status = "请等待当前设备操作完成后再关闭窗口。".into();
             false
         } else {
@@ -195,7 +253,26 @@ impl GuiState {
     }
 
     pub fn is_busy(&self) -> bool {
-        self.busy
+        !matches!(self.operation, Operation::Idle)
+    }
+
+    pub fn can_refresh(&self) -> bool {
+        !self.closed && !self.is_busy() && !self.removal_pending
+    }
+
+    pub fn removal_started(&mut self) {
+        self.removal_pending = true;
+        if !self.is_busy() {
+            self.status = "设备正在被移除，已暂停刷新。".into();
+        }
+    }
+
+    pub fn removal_finished(&mut self) {
+        self.removal_pending = false;
+    }
+
+    pub fn removal_pending(&self) -> bool {
+        self.removal_pending
     }
 
     fn selected_device(&self) -> Option<&Device> {

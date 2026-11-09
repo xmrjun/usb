@@ -7,6 +7,7 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
 
 use crate::{
     backend::{BackendError, Cancellation, EjectFailure, EjectResult, VetoKind},
+    eject_retry::request_with_retry,
     model::Device,
 };
 
@@ -46,23 +47,26 @@ pub(super) fn request_eject(
                 .into(),
         ));
     }
-    let devinst = locate_revalidated_target(&current.device)?;
+    // The full snapshot above has released its disk/volume handles. Between
+    // attempts, inspect only PnP properties so delayed closes can settle without
+    // opening the volumes again. The entire removable target and its descendant
+    // disk identities must still match the user's confirmed device each time.
+    request_with_retry(
+        cancellation,
+        || {
+            let devinst = locate_revalidated_target(&current.device)?;
+            confirm_target_identity(devinst, &current.device.target_instance_id)?;
+            Ok(devinst)
+        },
+        request_once,
+        std::thread::sleep,
+    )
+}
 
-    if cancellation.is_cancelled() {
-        return Err(BackendError(
-            "提交 PnP 请求前已取消安全弹出".into(),
-        ));
-    }
-    confirm_target_identity(devinst, &current.device.target_instance_id)?;
-    if cancellation.is_cancelled() {
-        return Err(BackendError(
-            "在提交 PnP 请求前的最后检查中取消了安全弹出".into(),
-        ));
-    }
-
+fn request_once(devinst: u32) -> Result<EjectResult, BackendError> {
     let mut veto_type = 0_i32;
     let mut veto_name = vec![0_u16; VETO_NAME_CAPACITY];
-    // SAFETY: devinst was resolved in the immediately preceding fresh snapshot;
+    // SAFETY: devinst was resolved and revalidated immediately before this call;
     // veto outputs are valid writable buffers, and flags must be zero.
     let result = unsafe {
         CM_Request_Device_EjectW(

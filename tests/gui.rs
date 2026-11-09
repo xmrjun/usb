@@ -1,5 +1,5 @@
 use usb_disk_ejector::{
-    backend::{EjectFailure, EjectResult, VetoKind},
+    backend::{BackendError, EjectFailure, EjectResult, VetoKind},
     gui::GuiState,
     model::{Device, Disk, Partition, Volume, VolumeExtent},
     policy::ListedDevice,
@@ -132,10 +132,112 @@ fn confirmation_and_veto_status_are_precise() {
     assert!(confirmation.contains("物理磁盘 5"));
     assert!(confirmation.contains(r"E:\"));
 
+    assert!(state.begin_eject().is_some());
     state.finish_eject(Ok(EjectResult::Rejected(EjectFailure {
         config_ret: 23,
         veto: Some((VetoKind::OutstandingOpen, "device-instance".into())),
     })));
     assert!(state.status().contains("设备实例标识符/路径"));
     assert!(!state.status().contains("占用进程"));
+}
+
+#[test]
+fn confirmation_reserves_the_operation_and_ejects_only_the_displayed_snapshot() {
+    let mut state = GuiState::new();
+    let listed = device("A", r"E:\");
+    let confirmed = listed.device.clone();
+    let generation = state.begin_refresh().unwrap();
+    state.finish_refresh(generation, Ok(vec![listed, device("B", r"G:\")]));
+    assert!(state.select(&confirmed.public_id));
+
+    let text = state.begin_confirmation().unwrap();
+    assert!(text.contains(r"E:\"));
+    assert!(state.is_busy());
+    assert!(state.begin_refresh().is_none());
+    assert!(state.begin_eject().is_none());
+    assert!(state.begin_confirmation().is_none());
+    assert!(!state.select(&device("B", r"G:\").device.public_id));
+
+    // A queued result processed inside MessageBox must not replace the device
+    // shown in the dialog or release the reservation.
+    state.finish_refresh(generation, Ok(vec![device("A", r"F:\")]));
+    assert!(state.is_busy());
+    assert_eq!(state.finish_confirmation(true), Some(confirmed));
+    assert!(state.is_busy());
+    assert!(state.begin_refresh().is_none());
+
+    // The same stale callback must not clear a running eject either.
+    state.finish_refresh(generation, Err(BackendError("late refresh".into())));
+    assert!(state.is_busy());
+    assert_eq!(state.rows().len(), 2);
+    assert!(state.rows()[0].mounts.contains(r"E:\"));
+    assert!(state.begin_eject().is_none());
+    state.finish_eject(Err(BackendError("test rejection".into())));
+    assert!(!state.is_busy());
+}
+
+#[test]
+fn cancelling_confirmation_restores_selection_and_allows_future_refresh() {
+    let mut state = GuiState::new();
+    let listed = device("A", r"E:\");
+    let id = listed.device.public_id.clone();
+    let generation = state.begin_refresh().unwrap();
+    state.finish_refresh(generation, Ok(vec![listed]));
+    assert!(state.select(&id));
+
+    assert!(state.begin_confirmation().is_some());
+    assert!(state.finish_confirmation(false).is_none());
+    assert_eq!(state.status(), "已取消安全弹出。");
+    assert!(!state.is_busy());
+    assert!(state.can_eject());
+    assert_eq!(state.selected_id(), Some(id.as_str()));
+    assert!(state.finish_confirmation(true).is_none());
+    assert!(state.begin_refresh().is_some());
+}
+
+#[test]
+fn direct_eject_cannot_overlap_refresh_or_start_after_close() {
+    let mut state = GuiState::new();
+    let listed = device("A", r"E:\");
+    let id = listed.device.public_id.clone();
+    let generation = state.begin_refresh().unwrap();
+    state.finish_refresh(generation, Ok(vec![listed.clone()]));
+    assert!(state.select(&id));
+
+    let active_refresh = state.begin_refresh().unwrap();
+    assert!(state.begin_eject().is_none());
+    assert!(state.begin_confirmation().is_none());
+    state.finish_eject(Ok(EjectResult::Ejected));
+    assert!(state.is_busy());
+    state.finish_refresh(generation, Ok(vec![]));
+    assert!(state.is_busy());
+    state.finish_refresh(active_refresh, Ok(vec![listed]));
+    assert!(state.can_eject());
+
+    state.close();
+    assert!(state.begin_eject().is_none());
+    assert!(state.begin_confirmation().is_none());
+    assert!(state.finish_confirmation(true).is_none());
+}
+
+#[test]
+fn external_removal_suppresses_refresh_and_invalidates_an_open_confirmation() {
+    let mut state = GuiState::new();
+    let listed = device("A", r"E:\");
+    let id = listed.device.public_id.clone();
+    let generation = state.begin_refresh().unwrap();
+    state.finish_refresh(generation, Ok(vec![listed]));
+    assert!(state.select(&id));
+    assert!(state.begin_confirmation().is_some());
+
+    state.removal_started();
+    assert!(state.removal_pending());
+    assert!(!state.can_refresh());
+    assert!(state.begin_refresh().is_none());
+    assert!(state.finish_confirmation(true).is_none());
+    assert!(state.status().contains("取消本次弹出确认"));
+    assert!(!state.can_eject());
+    state.removal_finished();
+    assert!(state.can_refresh());
+    assert!(state.begin_refresh().is_some());
 }
