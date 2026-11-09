@@ -1,0 +1,59 @@
+[package]
+name = "usb-disk-ejector"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "GPL-2.0-or-later"
+description = "Fail-closed Windows USB storage inventory and safe-eject tool"
+publish = false
+build = "build.rs"
+
+[lib]
+name = "usb_disk_ejector"
+path = "src/lib.rs"
+
+[[bin]]
+name = "usb-ejector"
+path = "src/bin/usb-ejector.rs"
+
+[[bin]]
+name = "usb-ejector-gui"
+path = "src/bin/usb-ejector-gui.rs"
+
+[dependencies]
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "=0.59.0"
+features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_Vhd",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Environment",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+

@@ -1,0 +1,17 @@
+USB Disk Ejector — experimental Windows x64 build
+
+WARNING: This build is not a stable release and has not been exercised
+end-to-end on Windows with physical USB media. Use only with disposable test
+media after saving all open work. The executables are not code-signed and may
+trigger Windows SmartScreen or publisher warnings.
+
+The program intentionally refuses removal when device identity, topology,
+partition/volume mapping, critical-storage use, or virtual-disk dependencies
+cannot be proven safe. Windows inventory and removal APIs are not one atomic
+transaction, so a residual time-of-check/time-of-use race remains.
+
+The program does not force-unmount volumes, terminate processes, elevate,
+install a service, write registry settings, or remain resident after exit.
+
+The GitHub prerelease notes identify the exact source commit, executable size,
+and SHA-256 digest. Verify that digest before testing.
