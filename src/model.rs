@@ -10,6 +10,16 @@ pub struct Disk {
     pub partition_count: u32,
     pub partitions: Vec<Partition>,
     pub partition_table_supported: bool,
+    /// Additional permission for the administrator volume preparation path.
+    /// Ordinary PnP eligibility still requires the complete policy checks.
+    pub volume_preparation_supported: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PartitionKind {
+    BasicData,
+    MicrosoftReserved,
+    Unsupported,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -17,6 +27,8 @@ pub struct Partition {
     pub number: u32,
     pub starting_offset: i64,
     pub length: i64,
+    pub kind: PartitionKind,
+    pub gpt_attributes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,6 +93,18 @@ impl Device {
         self.disks.iter().map(|disk| disk.partition_count).sum()
     }
 
+    pub fn supports_volume_preparation(&self) -> bool {
+        !self.disks.is_empty()
+            && self.disks.iter().all(|disk| {
+                disk.partition_table_supported
+                    && disk.volume_preparation_supported
+                    && !disk.partitions.is_empty()
+                    && disk.partitions.iter().all(|partition| {
+                        partition.kind == PartitionKind::BasicData && partition.gpt_attributes == 0
+                    })
+            })
+    }
+
     pub fn impact_summary(&self) -> String {
         let mut summary = format!("设备：{}\n", self.name);
         let mut disks = self.disks.iter().collect::<Vec<_>>();
@@ -133,14 +157,15 @@ impl Device {
         for disk in disks {
             let _ = write!(
                 canonical,
-                "|D:{}:{}:{}:{}:{}:{:?}:{}",
+                "|D:{}:{}:{}:{}:{}:{:?}:{}:{}",
                 disk.number,
                 disk.instance_id.to_uppercase(),
                 disk.serial.to_uppercase(),
                 disk.capacity_bytes,
                 disk.partition_count,
                 disk.partitions,
-                disk.partition_table_supported
+                disk.partition_table_supported,
+                disk.volume_preparation_supported
             );
         }
 

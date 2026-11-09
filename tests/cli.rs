@@ -3,7 +3,7 @@ use std::io::Cursor;
 use usb_disk_ejector::{
     backend::{Backend, BackendError, Cancellation, EjectFailure, EjectResult, VetoKind},
     cli::run,
-    model::{Device, Disk, Partition, Volume, VolumeExtent},
+    model::{Device, Disk, Partition, PartitionKind, Volume, VolumeExtent},
     policy::ListedDevice,
 };
 
@@ -54,8 +54,11 @@ fn device() -> ListedDevice {
                     number: 1,
                     starting_offset: 1_048_576,
                     length: 7_000_000_000,
+                    kind: PartitionKind::BasicData,
+                    gpt_attributes: 0,
                 }],
                 partition_table_supported: true,
+                volume_preparation_supported: true,
             }],
             vec![Volume {
                 id: "volume-one".into(),

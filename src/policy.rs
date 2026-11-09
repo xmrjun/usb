@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::model::{Device, Disk, Partition, Volume};
+use crate::model::{Device, Disk, Partition, PartitionKind, Volume};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BusType {
@@ -161,6 +161,8 @@ pub fn evaluate_inventory(inventory: Inventory) -> Vec<ListedDevice> {
             .collect::<Vec<Disk>>();
         disks.sort_by_key(|disk| disk.number);
 
+        // Eligibility permits the ordinary Windows PnP request. Administrator
+        // volume preparation additionally requires its separate device capability.
         let mut eligibility = if !inventory.complete {
             Err(BlockReason::InventoryIncomplete)
         } else if target.is_none() {
@@ -209,11 +211,8 @@ pub fn evaluate_inventory(inventory: Inventory) -> Vec<ListedDevice> {
                     .any(|number| !disk_numbers.contains(number))
             }) {
                 Err(BlockReason::CrossDiskVolume)
-            } else if candidates.iter().any(|candidate| {
-                !candidate.disk.partition_table_supported
-                    || candidate.disk.partition_count as usize != candidate.disk.partitions.len()
-                    || candidate.disk.partitions.is_empty()
-            }) || !partitions_fully_mapped(&disks, &volumes)
+            } else if disks.iter().any(|disk| !partition_layout_valid(disk))
+                || !partitions_safely_mapped(&disks, &volumes)
             {
                 Err(BlockReason::PartitionMappingIncomplete)
             } else if volumes.iter().any(|volume| {
@@ -286,7 +285,41 @@ fn normalize_volume_id(value: &str) -> String {
     value.trim_end_matches(['\\', '/']).to_ascii_uppercase()
 }
 
-fn partitions_fully_mapped(disks: &[Disk], volumes: &[Volume]) -> bool {
+fn partition_layout_valid(disk: &Disk) -> bool {
+    if !disk.partition_table_supported
+        || disk.partition_count as usize != disk.partitions.len()
+        || disk.partitions.is_empty()
+    {
+        return false;
+    }
+    let mut partitions = disk.partitions.iter().collect::<Vec<_>>();
+    partitions.sort_by_key(|partition| partition.starting_offset);
+    let mut previous_end = 0;
+    let mut numbers = BTreeSet::new();
+    let mut has_basic_data = false;
+    for partition in partitions {
+        if partition.kind == PartitionKind::Unsupported
+            || partition.gpt_attributes != 0
+            || partition.number == 0
+            || partition.starting_offset < previous_end
+            || partition.length <= 0
+            || !numbers.insert(partition.number)
+        {
+            return false;
+        }
+        let Some(end) = partition.starting_offset.checked_add(partition.length) else {
+            return false;
+        };
+        if end as u64 > disk.capacity_bytes {
+            return false;
+        }
+        previous_end = end;
+        has_basic_data |= partition.kind == PartitionKind::BasicData;
+    }
+    has_basic_data
+}
+
+fn partitions_safely_mapped(disks: &[Disk], volumes: &[Volume]) -> bool {
     let partitions = disks
         .iter()
         .flat_map(|disk| {
@@ -299,29 +332,33 @@ fn partitions_fully_mapped(disks: &[Disk], volumes: &[Volume]) -> bool {
         .iter()
         .flat_map(|volume| volume.extents.iter())
         .collect::<Vec<_>>();
-    partitions.len() == extents.len()
-        && partitions.iter().all(|(disk_number, partition)| {
-            extents
-                .iter()
-                .filter(|extent| {
-                    extent.disk_number == *disk_number
-                        && extent.starting_offset == partition.starting_offset
-                        && extent.extent_length == partition.length
-                })
-                .count()
-                == 1
-        })
-        && extents.iter().all(|extent| {
-            partitions
-                .iter()
-                .filter(|(disk_number, partition)| {
-                    extent.disk_number == *disk_number
-                        && extent.starting_offset == partition.starting_offset
-                        && extent.extent_length == partition.length
-                })
-                .count()
-                == 1
-        })
+    partitions.iter().all(|(disk_number, partition)| {
+        let matches = extents
+            .iter()
+            .filter(|extent| {
+                extent.disk_number == *disk_number
+                    && extent.starting_offset == partition.starting_offset
+                    && extent.extent_length == partition.length
+            })
+            .count();
+        match partition.kind {
+            PartitionKind::BasicData => matches == 1,
+            // A known, attribute-free MSR is reserved metadata, not a filesystem
+            // volume. It remains in the confirmed layout and is never prepared.
+            PartitionKind::MicrosoftReserved => matches == 0,
+            PartitionKind::Unsupported => false,
+        }
+    }) && extents.iter().all(|extent| {
+        partitions
+            .iter()
+            .filter(|(disk_number, partition)| {
+                extent.disk_number == *disk_number
+                    && extent.starting_offset == partition.starting_offset
+                    && extent.extent_length == partition.length
+            })
+            .count()
+            == 1
+    })
 }
 
 fn volume_mapping_valid(volume: &Volume) -> bool {

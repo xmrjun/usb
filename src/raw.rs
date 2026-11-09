@@ -1,6 +1,8 @@
 use std::error::Error;
 use std::fmt;
 
+use crate::model::PartitionKind;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParseError(pub &'static str);
 
@@ -24,12 +26,19 @@ pub struct PartitionRecord {
     pub number: u32,
     pub starting_offset: i64,
     pub length: i64,
+    pub kind: PartitionKind,
+    pub gpt_attributes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DriveLayout {
     pub partitions: Vec<PartitionRecord>,
+    /// Also permits a known MSR, which Windows does not expose as a volume.
+    pub ordinary_pnp_supported: bool,
+    /// Known basic partitions that may pass the ordinary PnP removal policy.
     pub simple_data_only: bool,
+    /// Stronger requirement for opening, locking and dismounting the volumes.
+    pub volume_preparation_supported: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -168,9 +177,10 @@ pub fn parse_disk_extents(bytes: &[u8]) -> Result<Vec<DiskExtent>, ParseError> {
 }
 
 /// Parses the Win64 `DRIVE_LAYOUT_INFORMATION_EX` layout used by the only
-/// supported Windows target. Unsupported, boot, service, dynamic, or RAW
-/// partition tables are returned as `simple_data_only = false` so policy can
-/// list but never eject them.
+/// supported Windows target. Only basic data partitions and attribute-free
+/// GPT MSRs may pass ordinary PnP policy. EFI, recovery, unknown, service,
+/// dynamic and RAW layouts remain unsupported. MSRs and active MBR partitions
+/// never permit administrator volume preparation.
 pub fn parse_drive_layout(bytes: &[u8]) -> Result<DriveLayout, ParseError> {
     const HEADER_SIZE: usize = 48;
     const ENTRY_SIZE: usize = 144;
@@ -180,6 +190,10 @@ pub fn parse_drive_layout(bytes: &[u8]) -> Result<DriveLayout, ParseError> {
     const BASIC_DATA_GUID: [u8; 16] = [
         0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44, 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99,
         0xc7,
+    ];
+    const MS_RESERVED_GUID: [u8; 16] = [
+        0x16, 0xe3, 0xc9, 0xe3, 0x5c, 0x0b, 0xb8, 0x4d, 0x81, 0x7d, 0xf9, 0x2d, 0xf0, 0x02, 0x15,
+        0xae,
     ];
     const SIMPLE_MBR_TYPES: [u8; 7] = [0x01, 0x04, 0x06, 0x07, 0x0b, 0x0c, 0x0e];
 
@@ -203,6 +217,8 @@ pub fn parse_drive_layout(bytes: &[u8]) -> Result<DriveLayout, ParseError> {
     }
 
     let mut simple_data_only = matches!(style, PARTITION_STYLE_MBR | PARTITION_STYLE_GPT);
+    let mut ordinary_pnp_supported = simple_data_only;
+    let mut has_active_mbr_partition = false;
     let mut partitions = Vec::with_capacity(count);
     for index in 0..count {
         let offset = HEADER_SIZE + index * ENTRY_SIZE;
@@ -220,40 +236,63 @@ pub fn parse_drive_layout(bytes: &[u8]) -> Result<DriveLayout, ParseError> {
         }
         if entry_style != style || number == 0 || starting_offset < 0 || length <= 0 {
             simple_data_only = false;
+            ordinary_pnp_supported = false;
         }
+        let mut kind = PartitionKind::Unsupported;
+        let mut gpt_attributes = 0;
         match style {
             PARTITION_STYLE_MBR => {
                 let partition_type = bytes[offset + 32];
-                let boot = bytes[offset + 33] != 0;
+                has_active_mbr_partition |= bytes[offset + 33] != 0;
                 let recognized = bytes[offset + 34] != 0;
-                if !SIMPLE_MBR_TYPES.contains(&partition_type) || boot || !recognized || is_service
-                {
+                if !SIMPLE_MBR_TYPES.contains(&partition_type) || !recognized || is_service {
                     simple_data_only = false;
+                    ordinary_pnp_supported = false;
+                } else {
+                    kind = PartitionKind::BasicData;
                 }
             }
             PARTITION_STYLE_GPT => {
                 let partition_type = bytes
                     .get(offset + 32..offset + 48)
                     .ok_or(ParseError("GPT partition type is truncated"))?;
-                let attributes = read_u64(bytes, offset + 64)?;
-                if partition_type != BASIC_DATA_GUID || attributes != 0 || is_service {
+                gpt_attributes = read_u64(bytes, offset + 64)?;
+                kind = if partition_type == BASIC_DATA_GUID {
+                    PartitionKind::BasicData
+                } else if partition_type == MS_RESERVED_GUID {
+                    PartitionKind::MicrosoftReserved
+                } else {
+                    PartitionKind::Unsupported
+                };
+                if kind != PartitionKind::BasicData || gpt_attributes != 0 || is_service {
                     simple_data_only = false;
                 }
+                if kind == PartitionKind::Unsupported || gpt_attributes != 0 || is_service {
+                    ordinary_pnp_supported = false;
+                }
             }
-            _ => simple_data_only = false,
+            _ => {
+                simple_data_only = false;
+                ordinary_pnp_supported = false;
+            }
         }
         partitions.push(PartitionRecord {
             number,
             starting_offset,
             length,
+            kind,
+            gpt_attributes,
         });
     }
     if partitions.is_empty() {
         simple_data_only = false;
+        ordinary_pnp_supported = false;
     }
     Ok(DriveLayout {
         partitions,
+        ordinary_pnp_supported,
         simple_data_only,
+        volume_preparation_supported: simple_data_only && !has_active_mbr_partition,
     })
 }
 

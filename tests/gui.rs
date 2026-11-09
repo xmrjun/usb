@@ -1,7 +1,7 @@
 use usb_disk_ejector::{
     backend::{BackendError, EjectFailure, EjectResult, VetoKind},
     gui::GuiState,
-    model::{Device, Disk, Partition, Volume, VolumeExtent},
+    model::{Device, Disk, Partition, PartitionKind, Volume, VolumeExtent},
     policy::ListedDevice,
 };
 
@@ -23,8 +23,11 @@ fn device(id_suffix: &str, mount: &str) -> ListedDevice {
                     number: 1,
                     starting_offset: 1_048_576,
                     length: 15_000_000_000,
+                    kind: PartitionKind::BasicData,
+                    gpt_attributes: 0,
                 }],
                 partition_table_supported: true,
+                volume_preparation_supported: true,
             }],
             vec![Volume {
                 id: format!("volume-{id_suffix}"),

@@ -1,5 +1,5 @@
 use std::fmt::Write;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Request_Device_EjectW, PNP_VetoDevice, PNP_VetoDriver, PNP_VetoIllegalDeviceRequest,
@@ -10,7 +10,7 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
 
 use crate::{
     backend::{BackendError, Cancellation, EjectFailure, EjectResult, VetoKind},
-    eject_retry::request_with_retry,
+    eject_retry::{request_with_retry, RETRY_TIME_BUDGET, SLOW_REQUEST_THRESHOLD},
     model::Device,
     volume_prepare::prepare_volumes,
 };
@@ -68,6 +68,14 @@ fn request_eject_inner(
     validate_snapshot(expected, cancellation, diagnostics, started)?;
     let ordinary = request_sequence(expected, cancellation, diagnostics, started, "普通弹出")?;
     if !needs_volume_preparation(&ordinary) {
+        return Ok(ordinary);
+    }
+    if !expected.supports_volume_preparation() {
+        trace(
+            diagnostics,
+            started,
+            "该设备仅支持普通 Windows 安全弹出；已跳过管理员卷准备，保留原始 Windows 拒绝结果。",
+        );
         return Ok(ordinary);
     }
     trace(
@@ -179,6 +187,15 @@ fn request_sequence(
     // attempts, inspect only PnP properties so delayed closes can settle without
     // opening the volumes again. The entire removable target and its descendant
     // disk identities must still match the user's confirmed device each time.
+    trace(
+        diagnostics,
+        started,
+        &format!(
+            "{phase}; 仅快速短暂拒绝重试; slow_request_ms={}; retry_budget_ms={}; 同步 Windows 请求不能中途超时取消",
+            SLOW_REQUEST_THRESHOLD.as_millis(),
+            RETRY_TIME_BUDGET.as_millis()
+        ),
+    );
     let mut attempt = 0;
     let result = request_with_retry(
         cancellation,
@@ -204,6 +221,12 @@ fn request_sequence(
     );
     if let Err(problem) = &result {
         trace(diagnostics, started, &format!("{phase} 阶段停止：{problem}"));
+    } else {
+        trace(
+            diagnostics,
+            started,
+            &format!("{phase} 阶段结束; attempts={attempt}"),
+        );
     }
     result
 }
@@ -212,10 +235,10 @@ fn request_once(
     devinst: u32,
     diagnostics: &mut String,
     started: Instant,
-) -> Result<EjectResult, BackendError> {
-    let began = Instant::now();
+) -> Result<(EjectResult, Duration), BackendError> {
     let mut veto_type = -1_i32;
     let mut veto_name = vec![0_u16; VETO_NAME_CAPACITY];
+    let began = Instant::now();
     // SAFETY: devinst was resolved and revalidated immediately before this call;
     // veto outputs are valid writable buffers, and flags must be zero.
     let result = unsafe {
@@ -227,6 +250,7 @@ fn request_once(
             0,
         )
     };
+    let duration = began.elapsed();
     if result == CR_SUCCESS {
         // Veto outputs are meaningful only on failure; success is CONFIGRET alone.
         trace(
@@ -234,10 +258,10 @@ fn request_once(
             started,
             &format!(
                 "CM_Request_Device_EjectW; CONFIGRET=0 (0x00000000); duration_ms={}; 成功",
-                began.elapsed().as_millis()
+                duration.as_millis()
             ),
         );
-        return Ok(EjectResult::Ejected);
+        return Ok((EjectResult::Ejected, duration));
     }
     let end = veto_name
         .iter()
@@ -250,13 +274,16 @@ fn request_once(
         &format!(
             "CM_Request_Device_EjectW; CONFIGRET={result} (0x{result:08x}); veto={veto_type} ({:?}); name={name:?}; duration_ms={}",
             map_veto(veto_type),
-            began.elapsed().as_millis()
+            duration.as_millis()
         ),
     );
-    Ok(EjectResult::Rejected(EjectFailure {
-        config_ret: result,
-        veto: Some((map_veto(veto_type), name)),
-    }))
+    Ok((
+        EjectResult::Rejected(EjectFailure {
+            config_ret: result,
+            veto: Some((map_veto(veto_type), name)),
+        }),
+        duration,
+    ))
 }
 
 fn needs_volume_preparation(result: &EjectResult) -> bool {

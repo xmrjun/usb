@@ -1,3 +1,4 @@
+use usb_disk_ejector::model::PartitionKind;
 use usb_disk_ejector::raw::{
     checked_dependency_entries_end, needs_virtual_dependency_query, parse_dependency_utf16,
     parse_disk_extents, parse_disk_geometry_capacity, parse_drive_layout, parse_multi_sz,
@@ -155,9 +156,11 @@ fn mbr_layout(partition_type: u8, boot: u8, recognized: u8) -> Vec<u8> {
 }
 
 #[test]
-fn drive_layout_accepts_only_simple_non_boot_data_partitions() {
+fn drive_layout_accepts_only_recognized_basic_data_partitions() {
     let layout = parse_drive_layout(&mbr_layout(0x0c, 0, 1)).unwrap();
     assert!(layout.simple_data_only);
+    assert!(layout.ordinary_pnp_supported);
+    assert!(layout.volume_preparation_supported);
     assert_eq!(layout.partitions.len(), 1);
     assert_eq!(layout.partitions[0].number, 1);
     assert_eq!(layout.partitions[0].starting_offset, 1_048_576);
@@ -169,15 +172,63 @@ fn drive_layout_accepts_only_simple_non_boot_data_partitions() {
             .simple_data_only
     );
     assert!(
-        !parse_drive_layout(&mbr_layout(0x0c, 1, 1))
-            .unwrap()
-            .simple_data_only
-    );
-    assert!(
         !parse_drive_layout(&mbr_layout(0x0c, 0, 0))
             .unwrap()
             .simple_data_only
     );
+}
+
+#[test]
+fn active_basic_mbr_partitions_allow_only_ordinary_pnp_removal() {
+    for partition_type in [0x01, 0x04, 0x06, 0x07, 0x0b, 0x0c, 0x0e] {
+        let inactive = parse_drive_layout(&mbr_layout(partition_type, 0, 1)).unwrap();
+        let active = parse_drive_layout(&mbr_layout(partition_type, 1, 1)).unwrap();
+        assert!(inactive.simple_data_only);
+        assert!(inactive.ordinary_pnp_supported);
+        assert!(inactive.volume_preparation_supported);
+        assert!(active.simple_data_only);
+        assert!(active.ordinary_pnp_supported);
+        assert!(!active.volume_preparation_supported);
+        assert_eq!(active.partitions, inactive.partitions);
+    }
+
+    let mut multiple = mbr_layout(0x0c, 1, 1);
+    push_u32(&mut multiple, 4, 2);
+    let mut inactive = mbr_layout(0x07, 0, 1);
+    push_u32(&mut inactive, 72, 2);
+    push_i64(&mut inactive, 56, 8_000_000_000);
+    multiple.extend_from_slice(&inactive[48..]);
+    let layout = parse_drive_layout(&multiple).unwrap();
+    assert_eq!(layout.partitions.len(), 2);
+    assert!(layout.simple_data_only);
+    assert!(!layout.volume_preparation_supported);
+}
+
+#[test]
+fn active_flag_does_not_admit_unsupported_or_malformed_partitions() {
+    let mut cases = vec![
+        mbr_layout(0x42, 1, 1), // Dynamic disk.
+        mbr_layout(0x0f, 1, 1), // Extended partition.
+        mbr_layout(0xee, 1, 1), // Protective MBR.
+        mbr_layout(0xef, 1, 1), // EFI system partition.
+        mbr_layout(0x99, 1, 1), // Unknown type.
+        mbr_layout(0x0c, 1, 0), // Not recognized by Windows.
+    ];
+    let mut service = mbr_layout(0x0c, 1, 1);
+    service[77] = 1;
+    cases.push(service);
+    let mut invalid_range = mbr_layout(0x0c, 1, 1);
+    push_i64(&mut invalid_range, 64, 0);
+    cases.push(invalid_range);
+    let mut invalid_style = mbr_layout(0x0c, 1, 1);
+    push_u32(&mut invalid_style, 48, 1);
+    cases.push(invalid_style);
+    for bytes in cases {
+        let layout = parse_drive_layout(&bytes).unwrap();
+        assert!(!layout.simple_data_only);
+        assert!(!layout.ordinary_pnp_supported);
+        assert!(!layout.volume_preparation_supported);
+    }
 }
 
 #[test]
@@ -200,11 +251,12 @@ fn drive_layout_ignores_unused_mbr_table_slots() {
     bytes[48..48 + 144].copy_from_slice(&used[48..]);
     let layout = parse_drive_layout(&bytes).unwrap();
     assert!(layout.simple_data_only);
+    assert!(layout.volume_preparation_supported);
     assert_eq!(layout.partitions.len(), 1);
 }
 
 #[test]
-fn drive_layout_accepts_basic_gpt_data_but_rejects_efi_and_required_partitions() {
+fn gpt_msr_is_supported_only_for_ordinary_pnp_and_other_special_types_stay_blocked() {
     const BASIC_DATA: [u8; 16] = [
         0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44, 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99,
         0xc7,
@@ -212,6 +264,18 @@ fn drive_layout_accepts_basic_gpt_data_but_rejects_efi_and_required_partitions()
     const EFI_SYSTEM: [u8; 16] = [
         0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11, 0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9,
         0x3b,
+    ];
+    const MS_RESERVED: [u8; 16] = [
+        0x16, 0xe3, 0xc9, 0xe3, 0x5c, 0x0b, 0xb8, 0x4d, 0x81, 0x7d, 0xf9, 0x2d, 0xf0, 0x02, 0x15,
+        0xae,
+    ];
+    const RECOVERY: [u8; 16] = [
+        0xa4, 0xbb, 0x94, 0xde, 0xd1, 0x06, 0x40, 0x4d, 0xa1, 0x6a, 0xbf, 0xd5, 0x01, 0x79, 0xd6,
+        0xac,
+    ];
+    const LDM_METADATA: [u8; 16] = [
+        0xaa, 0xc8, 0x08, 0x58, 0x8f, 0x7e, 0xe0, 0x42, 0x85, 0xd2, 0xe1, 0xe9, 0x04, 0x34, 0xcf,
+        0xb3,
     ];
     let make = |partition_type: [u8; 16], attributes: u64| {
         let mut bytes = vec![0_u8; 48 + 144];
@@ -246,4 +310,33 @@ fn drive_layout_accepts_basic_gpt_data_but_rejects_efi_and_required_partitions()
             .unwrap()
             .simple_data_only
     );
+    assert!(
+        parse_drive_layout(&make(BASIC_DATA, 0))
+            .unwrap()
+            .volume_preparation_supported
+    );
+    let msr = parse_drive_layout(&make(MS_RESERVED, 0)).unwrap();
+    assert!(msr.ordinary_pnp_supported);
+    assert!(!msr.simple_data_only);
+    assert!(!msr.volume_preparation_supported);
+    assert_eq!(msr.partitions[0].kind, PartitionKind::MicrosoftReserved);
+    let mut service_msr = make(MS_RESERVED, 0);
+    service_msr[77] = 1;
+    for bytes in [
+        make(EFI_SYSTEM, 0),
+        make(RECOVERY, 0),
+        make(RECOVERY, (1_u64 << 63) | 1),
+        make(LDM_METADATA, 0),
+        make([0xff; 16], 0),
+        make(MS_RESERVED, 1),
+        make(MS_RESERVED, 1_u64 << 63),
+        make(BASIC_DATA, 1),
+        make(BASIC_DATA, 1_u64 << 63),
+        service_msr,
+    ] {
+        let layout = parse_drive_layout(&bytes).unwrap();
+        assert!(!layout.simple_data_only);
+        assert!(!layout.ordinary_pnp_supported);
+        assert!(!layout.volume_preparation_supported);
+    }
 }

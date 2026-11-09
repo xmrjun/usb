@@ -1,5 +1,5 @@
 use usb_disk_ejector::model::{
-    format_capacity, stable_public_id, Device, Disk, Partition, Volume, VolumeExtent,
+    format_capacity, stable_public_id, Device, Disk, Partition, PartitionKind, Volume, VolumeExtent,
 };
 
 fn sample_device() -> Device {
@@ -20,14 +20,19 @@ fn sample_device() -> Device {
                     number: 1,
                     starting_offset: 1_048_576,
                     length: 10_000,
+                    kind: PartitionKind::BasicData,
+                    gpt_attributes: 0,
                 },
                 Partition {
                     number: 2,
                     starting_offset: 20_000,
                     length: 30_000,
+                    kind: PartitionKind::BasicData,
+                    gpt_attributes: 0,
                 },
             ],
             partition_table_supported: true,
+            volume_preparation_supported: true,
         }],
         vec![
             Volume {
@@ -113,6 +118,33 @@ fn fingerprint_changes_when_windows_reuses_a_disk_number() {
 }
 
 #[test]
+fn volume_preparation_requires_every_disk_and_is_part_of_confirmed_identity() {
+    let original = sample_device();
+    assert!(original.supports_volume_preparation());
+
+    let mut active = original.clone();
+    active.disks[0].volume_preparation_supported = false;
+    assert!(!active.supports_volume_preparation());
+    assert_eq!(original.public_id, active.public_id);
+    assert_ne!(original.fingerprint(), active.fingerprint());
+    assert!(!original.same_identity_and_impact(&active));
+
+    let mut multiple = original.clone();
+    let mut second = active.disks[0].clone();
+    second.number = 8;
+    multiple.disks.push(second);
+    assert!(!multiple.supports_volume_preparation());
+
+    let mut unsupported = original.clone();
+    unsupported.disks[0].partition_table_supported = false;
+    assert!(!unsupported.supports_volume_preparation());
+
+    let mut empty = original;
+    empty.disks.clear();
+    assert!(!empty.supports_volume_preparation());
+}
+
+#[test]
 fn fingerprint_covers_container_service_serial_and_partition_layout() {
     let original = sample_device();
     let mut container = sample_device();
@@ -135,6 +167,20 @@ fn fingerprint_changes_when_volume_extent_layout_changes() {
     let mut changed = sample_device();
     changed.volumes[0].extents[0].starting_offset += 4096;
     assert_ne!(original.fingerprint(), changed.fingerprint());
+}
+
+#[test]
+fn partition_role_and_attributes_are_part_of_the_confirmed_identity() {
+    let original = sample_device();
+    let mut changed = original.clone();
+    changed.disks[0].partitions[0].kind = PartitionKind::MicrosoftReserved;
+    assert!(!original.same_identity_and_impact(&changed));
+    assert!(!changed.supports_volume_preparation());
+
+    let mut attributes = original.clone();
+    attributes.disks[0].partitions[0].gpt_attributes = 1;
+    assert!(!original.same_identity_and_impact(&attributes));
+    assert!(!attributes.supports_volume_preparation());
 }
 
 #[test]

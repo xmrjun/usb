@@ -334,7 +334,9 @@ fn enumerate_disks() -> Result<DiskEnumeration, BackendError> {
             .capture(&path, partition_layout(&handle))
             .unwrap_or(crate::raw::DriveLayout {
                 partitions: Vec::new(),
+                ordinary_pnp_supported: false,
                 simple_data_only: false,
+                volume_preparation_supported: false,
             });
         let resolved_target = diagnostics
             .capture(&path, resolve_target(devinfo.DevInst, &instance_id))
@@ -355,9 +357,12 @@ fn enumerate_disks() -> Result<DiskEnumeration, BackendError> {
                         number: partition.number,
                         starting_offset: partition.starting_offset,
                         length: partition.length,
+                        kind: partition.kind,
+                        gpt_attributes: partition.gpt_attributes,
                     })
                     .collect(),
-                partition_table_supported: layout.simple_data_only,
+                partition_table_supported: layout.ordinary_pnp_supported,
+                volume_preparation_supported: layout.volume_preparation_supported,
             },
             bus_type: BusType::Usb,
             target: resolved_target.map(|(target, _)| target),
@@ -1535,6 +1540,7 @@ mod tests {
                     partition_count: 0,
                     partitions: Vec::new(),
                     partition_table_supported: false,
+                    volume_preparation_supported: false,
                 },
                 bus_type: BusType::Usb,
                 target: None,
@@ -1661,8 +1667,11 @@ mod tests {
                         number: 1,
                         starting_offset: 1_048_576,
                         length: 4_000_000,
+                        kind: crate::model::PartitionKind::BasicData,
+                        gpt_attributes: 0,
                     }],
                     partition_table_supported: true,
+                    volume_preparation_supported: true,
                 },
                 bus_type: BusType::Usb,
                 target: Some(target),
